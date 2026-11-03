@@ -1241,9 +1241,9 @@ typedef int BOOLEAN;typedef int32_t LONG;typedef unsigned UINT;typedef const wch
 typedef void *HWND,*HMENU;
 typedef struct {volatile int32_t busy_count;} QUEUE;
 static QUEUE file_queue,wfp_queue;
-static int monitor_disabling,monitor_closing,monitor_timer_failed;
+static int monitor_disabling,monitor_closing,monitor_destroying,monitor_timer_failed;
 static int busy,running,cfg=1,hashes=1,start_ok=1,stop_calls,starts,checked=1,menu_enabled=1,destroyed;
-static int timer_ok=1,timers,kills,logs,applying,installed,confirm_ok=1,confirm_calls,posts;
+static int timer_ok=1,destroy_ok=1,timers,kills,logs,applying,installed,confirm_ok=1,confirm_calls,posts;
 static int GUID_TrayIcon;
 static LONG InterlockedCompareExchange(volatile LONG *p,LONG v,LONG c) {LONG old=*p;if(old==c)*p=v;return old;}
 static int SetTimer(HWND h,int id,int ms,void *cb) {(void)h;(void)id;(void)ms;(void)cb;timers++;return timer_ok;}
@@ -1256,7 +1256,13 @@ static int _app_monitor_isrunning(void) {return running;}
 static void _app_monitor_stop(void) {stop_calls++;running=0;}
 static void _app_fileloggingenable(void) {starts++;running=start_ok;}
 static int _wfp_isfiltersapplying(void) {return applying;}
-static int DestroyWindow(HWND h) {(void)h;assert(!busy && !file_queue.busy_count && !wfp_queue.busy_count && !applying);destroyed++;return 1;}
+static int _app_monitor_finish_drain(HWND h);
+static int DestroyWindow(HWND h) {
+    assert(!busy && !file_queue.busy_count && !wfp_queue.busy_count && !applying);
+    assert(monitor_destroying && !_app_monitor_finish_drain(h)); /* Synchronous window messages reenter. */
+    if (!destroy_ok) return 0;
+    destroyed++;return 1;
+}
 static HMENU GetMenu(HWND h) {(void)h;return (void *)(uintptr_t)1;}
 static void _r_menu_checkitem(HMENU h,int id,int p,int flags,int value) {(void)h;(void)id;(void)p;(void)flags;checked=value;}
 static void _r_menu_enableitem(HMENU h,int id,int p,int value) {(void)h;(void)id;(void)p;menu_enabled=value;}
@@ -1273,8 +1279,8 @@ monitor_wrappers = ("\nstatic void toggle(HWND hwnd) { HMENU hmenu=GetMenu(hwnd)
     "static int close_event(HWND hwnd) { switch(WM_CLOSE) {" + close_case + "} return FALSE; }\n")
 monitor_tests = r'''
 static void reset(void) {
- monitor_disabling=monitor_closing=monitor_timer_failed=0;
- busy=0;running=cfg=hashes=start_ok=checked=menu_enabled=timer_ok=confirm_ok=1;
+ monitor_disabling=monitor_closing=monitor_destroying=monitor_timer_failed=0;
+ busy=0;running=cfg=hashes=start_ok=checked=menu_enabled=timer_ok=destroy_ok=confirm_ok=1;
  stop_calls=starts=destroyed=timers=kills=logs=applying=installed=confirm_calls=posts=0;
  file_queue.busy_count=wfp_queue.busy_count=0;
 }
@@ -1305,6 +1311,9 @@ int main(void) {
  reset();busy=1;timer_ok=0;close_event(h);
  assert(monitor_closing && !destroyed && monitor_timer_failed && logs==1 && posts==1);
  timer_ok=1;busy=0;assert(_app_monitor_finish_drain(h) && destroyed==1);
+ reset();busy=0;monitor_closing=1;destroy_ok=0;
+ assert(!_app_monitor_finish_drain(h) && !destroyed && !monitor_destroying && logs==1 && timers==1);
+ destroy_ok=1;assert(_app_monitor_finish_drain(h) && destroyed==1);
  reset();installed=1;confirm_ok=0;assert(close_event(h) && !stop_calls && !destroyed && !monitor_closing);
  reset();assert(close_event(h) && stop_calls==1 && destroyed==1 && cfg);
  puts("monitor disable, shutdown drain, start failure and timer failure checks passed");return 0;

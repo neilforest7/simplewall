@@ -9,6 +9,7 @@ static ULONG command_exit_code = ERROR_APP_INIT_FAILURE;
 
 static BOOLEAN monitor_disabling = FALSE;
 static BOOLEAN monitor_closing = FALSE;
+static BOOLEAN monitor_destroying = FALSE;
 static BOOLEAN monitor_timer_failed = FALSE;
 
 static VOID _app_monitor_schedule_drain (HWND hwnd)
@@ -34,7 +35,7 @@ static BOOLEAN _app_monitor_finish_drain (HWND hwnd)
 {
 	HMENU hmenu;
 
-	if (!monitor_disabling && !monitor_closing)
+	if (monitor_destroying || (!monitor_disabling && !monitor_closing))
 		return FALSE;
 
 	if (_app_monitor_isbusy () ||
@@ -48,9 +49,16 @@ static BOOLEAN _app_monitor_finish_drain (HWND hwnd)
 	KillTimer (hwnd, APP_MONITOR_DRAIN_TIMER);
 	if (monitor_closing)
 	{
-		_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: before DestroyWindow", 0, NULL);
-		DestroyWindow (hwnd);
-		_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: after DestroyWindow", 0, NULL);
+		// DestroyWindow sends window messages synchronously. Those messages must
+		// not initiate another destruction while this call is still in progress.
+		monitor_destroying = TRUE;
+		if (!DestroyWindow (hwnd))
+		{
+			monitor_destroying = FALSE;
+			_r_log (LOG_LEVEL_ERROR, NULL, L"Application window destruction failed", GetLastError (), NULL);
+			_app_monitor_schedule_drain (hwnd);
+			return FALSE;
+		}
 		return TRUE;
 	}
 
@@ -2513,7 +2521,6 @@ INT_PTR CALLBACK DlgProc (
 		{
 			HANDLE hengine;
 
-			_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: WM_DESTROY entered", 0, NULL);
 			_app_loginit (FALSE);
 
 			if (_r_queuedlock_islocked (&lock_apply))
@@ -2524,11 +2531,9 @@ INT_PTR CALLBACK DlgProc (
 
 			_r_tray_destroy (hwnd, &GUID_TrayIcon);
 
-			_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: before engine cleanup", 0, NULL);
 			hengine = _wfp_getenginehandle ();
 
 			_wfp_uninitialize (hengine, FALSE);
-			_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: after engine cleanup", 0, NULL);
 
 			_r_imagelist_destroy (config.himg_rules_small);
 			_r_imagelist_destroy (config.himg_rules_large);
@@ -2537,7 +2542,6 @@ INT_PTR CALLBACK DlgProc (
 			BufferedPaintUnInit ();
 
 			PostQuitMessage (0);
-			_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: quit message posted", 0, NULL);
 
 			break;
 		}
