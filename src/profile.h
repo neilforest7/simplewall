@@ -180,6 +180,17 @@ VOID _app_setruleiteminfo (
 	_In_ BOOLEAN include_apps
 );
 
+// Selectors are scoped even when invalid or when no executables match.
+BOOLEAN _app_rule_hasauto (_In_ PITEM_RULE ptr_rule);
+BOOLEAN _app_rule_autoisvalid (_In_ PITEM_RULE ptr_rule);
+BOOLEAN _app_rule_isglobal (_In_ PITEM_RULE ptr_rule);
+BOOLEAN _app_rule_issystemapp (_In_ PITEM_RULE ptr_rule, _In_ ULONG_PTR app_hash);
+BOOLEAN _app_rule_containsapp (_In_ PITEM_RULE ptr_rule, _In_ ULONG_PTR app_hash);
+BOOLEAN _app_rule_matchapp (_In_ PITEM_RULE ptr_rule, _In_ PITEM_APP ptr_app);
+// Call outside app/transaction locks, with lock_autoallow held exclusively.
+BOOLEAN _app_rule_refresh_autoapps (_In_ PITEM_RULE ptr_rule);
+VOID _app_autoallow_refresh (_In_opt_ HWND hwnd);
+
 VOID _app_ruleenable (
 	_Inout_ PITEM_RULE ptr_rule,
 	_In_ BOOLEAN is_enable,
@@ -230,6 +241,13 @@ _Ret_maybenull_
 PR_STRING _app_rulesexpandapps (
 	_In_ PITEM_RULE ptr_rule,
 	_In_ BOOLEAN is_fordisplay,
+	_In_ LPWSTR delimeter
+);
+
+// Caller holds lock_apps shared or exclusive.
+_Ret_maybenull_
+PR_STRING _app_rulesexpandapps_locked (
+	_In_ PITEM_RULE ptr_rule,
 	_In_ LPWSTR delimeter
 );
 

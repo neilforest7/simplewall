@@ -291,7 +291,8 @@ typedef struct _ITEM_APP
 		ULONG is_haveerrors : 1;
 		ULONG is_silent : 1;
 		ULONG is_undeletable : 1;
-		ULONG spare_bits : 28;
+		ULONG is_autoallow_blocked : 1; // explicit user opt-out from automatic rules
+		ULONG spare_bits : 27;
 	} DUMMYSTRUCTNAME;
 } ITEM_APP, *PITEM_APP;
 
@@ -322,7 +323,12 @@ typedef struct _ITEM_FILTER_CONFIG
 
 typedef struct _ITEM_RULE
 {
-	PR_HASHTABLE apps;
+	PR_HASHTABLE apps; // explicit associations, persisted
+	PR_HASHTABLE auto_apps; // derived associations, never persisted
+
+	PR_STRING auto_filename;
+	PR_STRING auto_directory;
+	PR_STRING auto_publisher;
 	PR_ARRAY guids;
 
 	PR_STRING name;
@@ -336,9 +342,10 @@ typedef struct _ITEM_RULE
 		ULONG is_enabled : 1;
 		ULONG is_haveerrors : 1;
 		ULONG is_forservices : 1;
+		ULONG is_fordriver : 1;
 		ULONG is_readonly : 1;
 		ULONG is_enabled_default : 1;
-		ULONG spare_bits : 27;
+		ULONG spare_bits : 26;
 	} DUMMYSTRUCTNAME;
 
 	union

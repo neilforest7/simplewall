@@ -1,0 +1,123 @@
+name: Automatic application rule tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rule-scope:
+    name: Linux regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Exercise production guards
+        run: |
+          python3 tests/autoallow_scope_test.py
+          python3 tests/autoallow_xml_presence_test.py
+          python3 tests/autoallow_revoke_test.py
+          python3 tests/autoallow_warning_test.py
+          python3 tests/autoallow_main_test.py
+
+  windows:
+    name: Build and test full application
+    needs: rule-scope
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: simplewall
+    steps:
+      - name: Require a GitHub-hosted Windows VM
+        working-directory: .
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+            throw 'The integration test requires a disposable GitHub-hosted Windows VM.'
+          }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: simplewall
+          persist-credentials: false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: simplerwall/routine
+          ref: 2f7ce6a228dbbaa7295b9635ab971d2768a0ae9b
+          path: routine
+          persist-credentials: false
+      - name: Download and verify CppWinRT
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP 'cppwinrt.zip'
+          Invoke-WebRequest -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.windows.cppwinrt/2.0.230706.1/microsoft.windows.cppwinrt.2.0.230706.1.nupkg' -OutFile $package
+          $expected = 'A99ECA1C244DD730B31554E6D4850E685F40BFB7CB0BD1CFB1561169FC3B692B'
+          if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -ne $expected) {
+            throw 'CppWinRT package hash mismatch.'
+          }
+          Expand-Archive -LiteralPath $package -DestinationPath 'packages/Microsoft.Windows.CppWinRT.2.0.230706.1'
+      - name: Build Release x64 and run matcher tests
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_DIR=%%i"
+          if not defined VS_DIR exit /b 1
+          call "%VS_DIR%\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          if not defined WindowsSDKVersion exit /b 1
+          "%VS_DIR%\MSBuild\Current\Bin\amd64\MSBuild.exe" simplewall.sln /m /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=%WindowsSDKVersion:~0,-1%
+          if errorlevel 1 exit /b 1
+          cl /nologo /W4 /WX /DUNICODE /D_UNICODE /Fe:autoallow_match_test.exe tests\autoallow_match_test.c src\autoallow_match.c
+          if errorlevel 1 exit /b 1
+          autoallow_match_test.exe "%ProgramFiles%\PowerShell\7\pwsh.exe"
+          if errorlevel 1 exit /b 1
+      - name: Record the built executable hash
+        id: built
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -LiteralPath 'bin/64/simplewall.exe' -Algorithm SHA256).Hash
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+      - name: Run WFP integration tests
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_DIR=%%i"
+          if not defined VS_DIR exit /b 1
+          call "%VS_DIR%\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          pwsh -NoProfile -File tests\windows_integration\run.ps1 -SimplewallExe bin\64\simplewall.exe
+          if errorlevel 1 exit /b 1
+      - name: Verify the rule editor
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_DIR=%%i"
+          if not defined VS_DIR exit /b 1
+          call "%VS_DIR%\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          pwsh -NoProfile -File tests\windows_gui\run.ps1 -SimplewallExe bin\64\simplewall.exe
+          if errorlevel 1 exit /b 1
+      - name: Prepare the tested application
+        shell: pwsh
+        env:
+          BUILT_SHA256: ${{ steps.built.outputs.sha256 }}
+        run: |
+          $exe = 'bin/64/simplewall.exe'
+          if ((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ne $env:BUILT_SHA256) {
+            throw 'The executable changed during testing.'
+          }
+          $artifact = Join-Path $env:RUNNER_TEMP 'simplewall-artifact'
+          New-Item -ItemType Directory -Path $artifact | Out-Null
+          Copy-Item -LiteralPath $exe, 'bin/simplewall.lng', 'LICENSE' -Destination $artifact
+          if ((Get-FileHash -LiteralPath (Join-Path $artifact 'simplewall.exe') -Algorithm SHA256).Hash -ne $env:BUILT_SHA256) {
+            throw 'The artifact executable does not match the tested build.'
+          }
+      - name: Upload tested application
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: simplewall-windows-x64
+          path: ${{ runner.temp }}/simplewall-artifact/
+          if-no-files-found: error
+          retention-days: 7

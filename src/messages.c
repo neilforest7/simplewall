@@ -70,7 +70,6 @@ VOID _app_message_initialize (
 		_r_menu_checkitem (hmenu, IDM_LOADONSTARTUP_CHK, 0, MF_BYCOMMAND, _r_autorun_isenabled ());
 		_r_menu_checkitem (hmenu, IDM_STARTMINIMIZED_CHK, 0, MF_BYCOMMAND, _r_config_getboolean (L"IsStartMinimized", FALSE));
 		_r_menu_checkitem (hmenu, IDM_SKIPUACWARNING_CHK, 0, MF_BYCOMMAND, _r_skipuac_isenabled ());
-		_r_menu_checkitem (hmenu, IDM_CHECKUPDATES_CHK, 0, MF_BYCOMMAND, _r_update_isenabled (FALSE));
 		_r_menu_checkitem (hmenu, IDM_RULE_BLOCKOUTBOUND, 0, MF_BYCOMMAND, _r_config_getboolean (L"BlockOutboundConnections", TRUE));
 		_r_menu_checkitem (hmenu, IDM_RULE_BLOCKINBOUND, 0, MF_BYCOMMAND, _r_config_getboolean (L"BlockInboundConnections", TRUE));
 		_r_menu_checkitem (hmenu, IDM_RULE_ALLOWLOOPBACK, 0, MF_BYCOMMAND, _r_config_getboolean (L"AllowLoopbackConnections", TRUE));
@@ -286,7 +285,6 @@ VOID _app_message_localize (
 		_r_menu_setitemtext (hmenu, IDM_LOADONSTARTUP_CHK, FALSE, _r_locale_getstring (IDS_LOADONSTARTUP_CHK));
 		_r_menu_setitemtext (hmenu, IDM_STARTMINIMIZED_CHK, FALSE, _r_locale_getstring (IDS_STARTMINIMIZED_CHK));
 		_r_menu_setitemtext (hmenu, IDM_SKIPUACWARNING_CHK, FALSE, _r_locale_getstring (IDS_SKIPUACWARNING_CHK));
-		_r_menu_setitemtext (hmenu, IDM_CHECKUPDATES_CHK, FALSE, _r_locale_getstring (IDS_CHECKUPDATES_CHK));
 
 		_r_menu_setitemtext (hmenu, IDM_RULE_BLOCKOUTBOUND, FALSE, _r_locale_getstring (IDS_RULE_BLOCKOUTBOUND));
 		_r_menu_setitemtext (hmenu, IDM_RULE_BLOCKINBOUND, FALSE, _r_locale_getstring (IDS_RULE_BLOCKINBOUND));
@@ -339,7 +337,6 @@ VOID _app_message_localize (
 
 		// help submenu
 		_r_menu_setitemtext (hmenu, IDM_WEBSITE, FALSE, _r_locale_getstring (IDS_WEBSITE));
-		_r_menu_setitemtext (hmenu, IDM_CHECKUPDATES, FALSE, _r_locale_getstring (IDS_CHECKUPDATES));
 		_r_menu_setitemtextformat (hmenu, IDM_ABOUT, FALSE, L"%s\tF1", _r_locale_getstring (IDS_ABOUT));
 	}
 
@@ -1297,7 +1294,7 @@ VOID _app_displayinforule_callback (
 			{
 				if (ptr_rule->is_enabled)
 				{
-					if (ptr_rule->is_forservices || !_r_obj_isempty (ptr_rule->apps))
+					if (!_app_rule_isglobal (ptr_rule))
 					{
 						lpnmlv->item.iGroupId = 1;
 					}
@@ -1810,6 +1807,7 @@ VOID _app_command_idtorules (
 	INT listview_id;
 	INT item_id = INT_ERROR;
 	BOOL is_remove = INT_ERROR;
+	BOOLEAN is_rebuild_failed = FALSE;
 
 	listview_id = _app_listview_getcontext (hwnd, INT_ERROR)->listview_id;
 
@@ -1826,7 +1824,7 @@ VOID _app_command_idtorules (
 	{
 		app_hash = _app_listview_getappcontext (hwnd, listview_id, item_id);
 
-		if (ptr_rule->is_forservices && _app_issystemhash (app_hash))
+		if (_app_rule_issystemapp (ptr_rule, app_hash))
 			continue;
 
 		ptr_app = _app_getappitem (app_hash);
@@ -1836,8 +1834,15 @@ VOID _app_command_idtorules (
 
 		_app_notify_freeobject (NULL, ptr_app);
 
+		_r_queuedlock_acquireexclusive (&lock_autoallow);
+
 		if (is_remove == INT_ERROR)
-			is_remove = !!(ptr_rule->is_enabled && _r_obj_findhashtable (ptr_rule->apps, app_hash));
+			is_remove = !!(ptr_rule->is_enabled && _app_rule_containsapp (ptr_rule, app_hash));
+
+		if (is_remove && _app_rule_hasauto (ptr_rule) && _app_rule_containsapp (ptr_rule, app_hash))
+			ptr_app->is_autoallow_blocked = TRUE;
+
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
 
 		_app_setruletoapp (hwnd, ptr_rule, item_id, ptr_app, !is_remove);
 
@@ -1852,10 +1857,13 @@ VOID _app_command_idtorules (
 
 		_r_obj_addlistitem (rules, ptr_rule);
 
-		_wfp_create4filters (hengine, rules, DBG_ARG, FALSE);
+		is_rebuild_failed = !_wfp_createrulefilters (hengine, rules, DBG_ARG, FALSE);
 
 		_r_obj_dereference (rules);
 	}
+
+	if (!is_rebuild_failed && _app_rule_hasauto (ptr_rule))
+		_app_autoallow_refresh (hwnd);
 
 	_app_listview_updateby_id (hwnd, listview_id, 0);
 	_app_listview_updateitemby_param (hwnd, rule_idx, FALSE);
@@ -1863,6 +1871,9 @@ VOID _app_command_idtorules (
 	_r_obj_dereference (ptr_rule);
 
 	_app_profile_save (hwnd);
+
+	if (is_rebuild_failed)
+		_r_show_message (hwnd, MB_OK | MB_ICONERROR, NULL, L"Could not update the rule filters. Previous filters may still be active. Review the rule and retry.");
 }
 
 VOID _app_command_idtotimers (
@@ -1906,7 +1917,7 @@ VOID _app_command_idtotimers (
 			}
 		}
 
-		_wfp_create3filters (hengine, rules, TEXT (__FILE__), __LINE__, FALSE);
+		_wfp_createappfilters (hengine, rules, TEXT (__FILE__), __LINE__, FALSE);
 
 		_r_obj_dereference (rules);
 	}
@@ -2152,6 +2163,8 @@ VOID _app_command_checkbox (
 	INT item_id = INT_ERROR;
 	BOOLEAN new_val = (ctrl_id == IDM_CHECK);
 	BOOLEAN is_changed = FALSE;
+	BOOLEAN is_item_changed;
+	BOOLEAN is_rebuild_failed = FALSE;
 
 	rules = _r_obj_createlist (8, &_r_obj_dereference);
 	listview_id = _app_listview_getcontext (hwnd, INT_ERROR)->listview_id;
@@ -2166,18 +2179,25 @@ VOID _app_command_checkbox (
 			if (!ptr_app)
 				continue;
 
-			if (ptr_app->is_enabled != new_val)
+			_r_queuedlock_acquireexclusive (&lock_autoallow);
+			is_item_changed = (ptr_app->is_enabled != new_val || ptr_app->is_autoallow_blocked == new_val);
+
+			if (is_item_changed)
 			{
+				ptr_app->is_autoallow_blocked = !new_val;
+
 				if (!new_val)
-				{
-					_app_timer_reset (hwnd, ptr_app);
-				}
-				else
-				{
-					_app_notify_freeobject (NULL, ptr_app);
-				}
+					_app_timer_reset (NULL, ptr_app);
 
 				ptr_app->is_enabled = new_val;
+			}
+
+			_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+			if (is_item_changed)
+			{
+				if (new_val)
+					_app_notify_freeobject (NULL, ptr_app);
 
 				_app_listview_lock (hwnd, listview_id, TRUE);
 				_app_setappiteminfo (hwnd, listview_id, item_id, ptr_app);
@@ -2201,9 +2221,12 @@ VOID _app_command_checkbox (
 			{
 				hengine = _wfp_getenginehandle ();
 
-				_wfp_create3filters (hengine, rules, DBG_ARG, FALSE);
+				is_rebuild_failed = !_wfp_createappfilters (hengine, rules, DBG_ARG, FALSE);
 			}
 		}
+
+		if (is_changed && !is_rebuild_failed)
+			_app_autoallow_refresh (hwnd);
 	}
 	else if (listview_id >= IDC_RULES_BLOCKLIST && listview_id <= IDC_RULES_CUSTOM)
 	{
@@ -2215,10 +2238,16 @@ VOID _app_command_checkbox (
 			if (!ptr_rule)
 				continue;
 
-			if (ptr_rule->is_enabled != new_val)
-			{
+			_r_queuedlock_acquireexclusive (&lock_autoallow);
+			is_item_changed = (ptr_rule->is_enabled != new_val);
+
+			if (is_item_changed)
 				_app_ruleenable (ptr_rule, new_val, TRUE);
 
+			_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+			if (is_item_changed)
+			{
 				_app_listview_lock (hwnd, listview_id, TRUE);
 				_app_setruleiteminfo (hwnd, listview_id, item_id, ptr_rule, TRUE);
 				_app_listview_lock (hwnd, listview_id, FALSE);
@@ -2241,7 +2270,7 @@ VOID _app_command_checkbox (
 			{
 				hengine = _wfp_getenginehandle ();
 
-				_wfp_create4filters (hengine, rules, DBG_ARG, FALSE);
+				is_rebuild_failed = !_wfp_createrulefilters (hengine, rules, DBG_ARG, FALSE);
 			}
 		}
 	}
@@ -2254,6 +2283,9 @@ VOID _app_command_checkbox (
 
 		_app_profile_save (hwnd);
 	}
+
+	if (is_rebuild_failed)
+		_r_show_message (hwnd, MB_OK | MB_ICONERROR, NULL, L"Could not update the filters. Previous filters may still be active. Review the affected items and retry.");
 }
 
 VOID _app_command_delete (
@@ -2262,12 +2294,10 @@ VOID _app_command_delete (
 {
 	R_STRINGREF crlf = PR_STRINGREF_INIT (SZ_CRLF);
 	R_STRINGBUILDER sb;
-	PR_ARRAY guids = NULL;
 	PITEM_NETWORK ptr_network;
 	PR_HASHTABLE apps_checker;
 	MIB_TCPROW tcprow;
 	PR_STRING string;
-	HANDLE hengine;
 	PITEM_APP ptr_app;
 	PITEM_RULE ptr_rule;
 	ULONG_PTR hash_code;
@@ -2277,6 +2307,7 @@ VOID _app_command_delete (
 	LPARAM lparam;
 	INT listview_id;
 	INT item_count;
+	BOOLEAN is_revoke_failed = FALSE;
 
 	listview_id = _app_listview_getcontext (hwnd, INT_ERROR)->listview_id;
 
@@ -2340,10 +2371,10 @@ VOID _app_command_delete (
 			return;
 		}
 
-		guids = _r_obj_createarray (sizeof (GUID), 10, NULL);
-
 		_r_obj_dereference (string);
 	}
+
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
 
 	for (INT i = item_count - 1; i != INT_ERROR; i--)
 	{
@@ -2360,8 +2391,14 @@ VOID _app_command_delete (
 
 			if (!ptr_app->is_undeletable) // skip "undeletable" apps
 			{
-				if (!_r_obj_isempty (ptr_app->guids))
-					_r_obj_addarrayitems (guids, ptr_app->guids->items, ptr_app->guids->count);
+				if (!_wfp_destroyfilters_array (_wfp_getenginehandle (), ptr_app->guids, DBG_ARG))
+				{
+					is_revoke_failed = TRUE;
+					ptr_app->is_haveerrors = TRUE;
+					_app_listview_updateitemby_param (hwnd, hash_code, TRUE);
+					_r_obj_dereference (ptr_app);
+					continue;
+				}
 
 				_r_listview_deleteitem (hwnd, listview_id, i);
 
@@ -2385,10 +2422,18 @@ VOID _app_command_delete (
 
 			if (!ptr_rule->is_readonly) // skip "read-only" rules
 			{
-				apps_checker = _r_obj_createhashtable (sizeof (SHORT), 6, NULL);
+				// Revoke while the rule still owns its IDs and remains visible.
+				// A Windows failure must not orphan an automatic permit.
+				if (!_wfp_destroyfilters_array (_wfp_getenginehandle (), ptr_rule->guids, DBG_ARG))
+				{
+					is_revoke_failed = TRUE;
+					ptr_rule->is_haveerrors = TRUE;
+					_app_listview_updateitemby_param (hwnd, rule_idx, FALSE);
+					_r_obj_dereference (ptr_rule);
+					continue;
+				}
 
-				if (!_r_obj_isempty (ptr_rule->guids))
-					_r_obj_addarrayitems (guids, ptr_rule->guids->items, ptr_rule->guids->count);
+				apps_checker = _r_obj_createhashtable (sizeof (SHORT), 6, NULL);
 
 				enum_key = 0;
 
@@ -2397,9 +2442,15 @@ VOID _app_command_delete (
 					_r_obj_addhashtableitem (apps_checker, hash_code, NULL);
 				}
 
-				_r_listview_deleteitem (hwnd, listview_id, i);
+				enum_key = 0;
+				_r_queuedlock_acquireshared (&lock_autoapps);
 
-				_r_obj_reference (ptr_rule); // required to dereference later
+				while (_r_obj_enumhashtable (ptr_rule->auto_apps, NULL, &hash_code, &enum_key))
+					_r_obj_addhashtableitem (apps_checker, hash_code, NULL);
+
+				_r_queuedlock_releaseshared (&lock_autoapps);
+
+				_r_listview_deleteitem (hwnd, listview_id, i);
 
 				_r_queuedlock_acquireexclusive (&lock_rules);
 				_r_obj_setlistitem (rules_list, rule_idx, NULL);
@@ -2411,6 +2462,8 @@ VOID _app_command_delete (
 				{
 					_app_listview_updateitemby_param (hwnd, hash_code, TRUE);
 				}
+
+				_r_obj_dereference (apps_checker);
 			}
 
 			_r_obj_dereference (ptr_rule);
@@ -2445,24 +2498,17 @@ VOID _app_command_delete (
 		}
 	}
 
-	if (guids)
-	{
-		if (!_r_obj_isempty (guids))
-		{
-			if (_wfp_isfiltersinstalled ())
-			{
-				hengine = _wfp_getenginehandle ();
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
 
-				_wfp_destroyfilters_array (hengine, guids, DBG_ARG);
-			}
-		}
-
-		_r_obj_dereference (guids);
-	}
+	if (!is_revoke_failed && listview_id != IDC_NETWORK)
+		_app_autoallow_refresh (hwnd);
 
 	_app_listview_updateby_id (hwnd, listview_id, 0);
 
 	_app_profile_save (hwnd);
+
+	if (is_revoke_failed)
+		_r_show_message (hwnd, MB_OK | MB_ICONERROR, NULL, L"Some items could not be deleted because their filters could not be removed. Those items and their existing filters were kept. Retry the deletion.");
 }
 
 VOID _app_command_disable (
@@ -2830,13 +2876,11 @@ VOID _app_command_purgeunused (
 	PITEM_APP ptr_app = NULL;
 	PR_STRING string = NULL;
 	PR_HASHTABLE apps_list;
-	PR_ARRAY guids;
-	HANDLE hengine;
 	ULONG_PTR enum_key = 0;
 	ULONG_PTR hash_code;
+	BOOLEAN is_revoke_failed = FALSE;
 
 	apps_list = _r_obj_createhashtable (sizeof (ULONG_PTR), 8, NULL);
-	guids = _r_obj_createarray (sizeof (GUID), 10, NULL);
 
 	_r_obj_initializestringbuilder (&sb, 256);
 
@@ -2846,15 +2890,6 @@ VOID _app_command_purgeunused (
 	{
 		if (!_app_isappunused (ptr_app) || ptr_app->type == DATA_APP_SERVICE || ptr_app->type == DATA_APP_UWP)
 			continue;
-
-		_app_deleteappitem (hwnd, ptr_app->type, hash_code);
-
-		_app_timer_reset (NULL, ptr_app);
-
-		_app_notify_freeobject (NULL, ptr_app);
-
-		if (!_r_obj_isempty (ptr_app->guids))
-			_r_obj_addarrayitems (guids, ptr_app->guids->items, ptr_app->guids->count);
 
 		_r_obj_addhashtableitem (apps_list, hash_code, NULL);
 
@@ -2883,21 +2918,37 @@ VOID _app_command_purgeunused (
 
 		if (_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_PURGE_UNUSED), string->buffer, L"ConfirmUnused", FALSE))
 		{
-			_r_queuedlock_acquireexclusive (&lock_apps);
+			_r_queuedlock_acquireexclusive (&lock_autoallow);
 
 			while (_r_obj_enumhashtable (apps_list, NULL, &hash_code, &enum_key))
 			{
+				ptr_app = _app_getappitem (hash_code);
+
+				if (!ptr_app)
+					continue;
+
+				if (!_wfp_destroyfilters_array (_wfp_getenginehandle (), ptr_app->guids, DBG_ARG))
+				{
+					is_revoke_failed = TRUE;
+					ptr_app->is_haveerrors = TRUE;
+					_r_obj_dereference (ptr_app);
+					continue;
+				}
+
+				_app_deleteappitem (hwnd, ptr_app->type, hash_code);
+				_app_timer_reset (NULL, ptr_app);
+				_app_notify_freeobject (NULL, ptr_app);
+
+				_r_queuedlock_acquireexclusive (&lock_apps);
 				_app_freeapplication (hwnd, hash_code);
+				_r_queuedlock_releaseexclusive (&lock_apps);
+				_r_obj_dereference (ptr_app);
 			}
 
-			_r_queuedlock_releaseexclusive (&lock_apps);
+			_r_queuedlock_releaseexclusive (&lock_autoallow);
 
-			if (!_r_obj_isempty2 (guids) && _wfp_isfiltersinstalled ())
-			{
-				hengine = _wfp_getenginehandle ();
-
-				_wfp_destroyfilters_array (hengine, guids, DBG_ARG);
-			}
+			if (!is_revoke_failed)
+				_app_autoallow_refresh (hwnd);
 
 			_app_listview_updateby_id (hwnd, DATA_LISTVIEW_CURRENT, PR_UPDATE_TYPE | PR_UPDATE_FORCE);
 
@@ -2908,7 +2959,9 @@ VOID _app_command_purgeunused (
 	_r_obj_deletestringbuilder (&sb);
 
 	_r_obj_dereference (apps_list);
-	_r_obj_dereference (guids);
+
+	if (is_revoke_failed)
+		_r_show_message (hwnd, MB_OK | MB_ICONERROR, NULL, L"Some applications could not be removed because their filters could not be removed. Those applications and their existing filters were kept. Retry the cleanup.");
 }
 
 VOID _app_command_purgetimers (
@@ -2978,7 +3031,7 @@ VOID _app_command_purgetimers (
 			{
 				hengine = _wfp_getenginehandle ();
 
-				_wfp_create3filters (hengine, rules, DBG_ARG, FALSE);
+				_wfp_createappfilters (hengine, rules, DBG_ARG, FALSE);
 			}
 
 			for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)

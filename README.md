@@ -25,6 +25,7 @@ The lightweight application is less than a megabyte, and it is compatible with W
 You can download either the installer or portable version. For correct working you are require administrator rights.
 
 ### Features:
+- [Automatic application allow rules](docs/automatic-app-rules.md): exact executable name, optional installation directory and verified publisher (development branch; see build status)
 - Simple interface without annoying pop ups
 - [Rules editor](https://github.com/henrypp/simplewall#rules-editor) (create your own rules)
 - [Internal blocklist](https://crazymax.dev/WindowsSpyBlocker/blocking-rules/simplewall/) (block Windows spy / telemetry)

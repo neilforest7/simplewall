@@ -1360,6 +1360,7 @@ VOID NTAPI _app_logthread (
 	BOOLEAN is_exludestealth;
 	BOOLEAN is_loguienabled;
 	BOOLEAN is_exludeallow;
+	BOOLEAN is_autoallowed = FALSE;
 	BOOLEAN is_silent = FALSE;
 	BOOLEAN is_logenabled;
 	BOOLEAN is_notexist;
@@ -1389,6 +1390,9 @@ VOID NTAPI _app_logthread (
 	if (!ptr_app)
 		ptr_app = _app_getappitem (ptr_log->app_hash);
 
+	if (ptr_app && ptr_log->is_myprovider && !ptr_log->is_allow && !ptr_log->is_custom && !ptr_log->is_blocklist && !ptr_log->is_system && !ptr_app->is_autoallow_blocked)
+		is_autoallowed = _wfp_autoallow_app (hwnd, ptr_app, ptr_log);
+
 	is_logenabled = _r_config_getboolean (L"IsLogEnabled", FALSE);
 	is_loguienabled = _r_config_getboolean (L"IsLogUiEnabled", FALSE);
 	is_notificationenabled = _r_config_getboolean (L"IsNotificationsEnabled", TRUE);
@@ -1416,7 +1420,7 @@ VOID NTAPI _app_logthread (
 				_app_logwrite_ui (hwnd, ptr_log);
 
 			// display notification
-			if (is_notificationenabled)
+			if (is_notificationenabled && !is_autoallowed)
 			{
 				if (ptr_app && !ptr_log->is_allow && is_exludeblocklist)
 				{

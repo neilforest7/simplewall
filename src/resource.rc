@@ -91,7 +91,6 @@ BEGIN
 		MENUITEM " ", IDM_LOADONSTARTUP_CHK
 		MENUITEM " ", IDM_STARTMINIMIZED_CHK
 		MENUITEM " ", IDM_SKIPUACWARNING_CHK
-		MENUITEM " ", IDM_CHECKUPDATES_CHK
 		MENUITEM SEPARATOR
 		POPUP " "
 		BEGIN
@@ -139,7 +138,6 @@ BEGIN
 	POPUP " "
 	BEGIN
 		MENUITEM " ", IDM_WEBSITE
-		MENUITEM " ", IDM_CHECKUPDATES
 		MENUITEM " ", IDM_ABOUT
 	END
 END
@@ -339,6 +337,25 @@ BEGIN
 
 	GROUPBOX		"", IDC_APP_COMMENT, 6, 122, 274, 34, WS_GROUP
 	EDITTEXT		IDC_APP_COMMENT_ID, 12, 136, 262, 12, WS_TABSTOP | ES_AUTOHSCROLL
+
+	AUTOCHECKBOX	"", IDC_APP_AUTO_BLOCK_CHK, 8, 160, 270, 14, BS_VCENTER | WS_TABSTOP
+END
+
+IDD_EDITOR_AUTOAPPS DIALOGEX 0, 0, 292, 210
+STYLE WS_CHILD | WS_SYSMENU | WS_TABSTOP | WS_GROUP | DS_SHELLFONT | DS_CONTROL
+EXSTYLE WS_EX_CONTROLPARENT
+FONT 8, "Ms Shell Dlg"
+BEGIN
+	GROUPBOX		"", IDC_AUTO_FILENAME, 6, 6, 274, 32, WS_GROUP
+	EDITTEXT		IDC_AUTO_FILENAME_ID, 12, 18, 262, 12, WS_TABSTOP | ES_AUTOHSCROLL
+
+	GROUPBOX		"", IDC_AUTO_DIRECTORY, 6, 40, 274, 32, WS_GROUP
+	EDITTEXT		IDC_AUTO_DIRECTORY_ID, 12, 52, 262, 12, WS_TABSTOP | ES_AUTOHSCROLL
+
+	GROUPBOX		"", IDC_AUTO_PUBLISHER, 6, 74, 274, 32, WS_GROUP
+	EDITTEXT		IDC_AUTO_PUBLISHER_ID, 12, 86, 262, 12, WS_TABSTOP | ES_AUTOHSCROLL
+
+	LTEXT			"", IDC_AUTO_HINT, 6, 112, 274, 60
 END
 
 IDD_EDITOR_APPRULES DIALOGEX 0, 0, 272, 240
@@ -370,18 +387,16 @@ STYLE WS_CHILD | WS_SYSMENU | WS_TABSTOP | WS_GROUP | DS_SHELLFONT | DS_CONTROL
 EXSTYLE WS_EX_CONTROLPARENT
 FONT 8, "Ms Shell Dlg"
 BEGIN
-	GROUPBOX		"", IDC_TITLE_GENERAL, 0, 0, 262, 78, WS_GROUP
+	GROUPBOX		"", IDC_TITLE_GENERAL, 0, 0, 262, 66, WS_GROUP
 
 	AUTOCHECKBOX	"", IDC_ALWAYSONTOP_CHK, 8, 12, 246, 12
 	AUTOCHECKBOX	"", IDC_LOADONSTARTUP_CHK, 8, 24, 246, 12
 	AUTOCHECKBOX	"", IDC_STARTMINIMIZED_CHK, 8, 36, 246, 12
 	AUTOCHECKBOX	"", IDC_SKIPUACWARNING_CHK, 8, 48, 246, 12
-	AUTOCHECKBOX	"", IDC_CHECKUPDATES_CHK, 8, 60, 246, 12
+	GROUPBOX		"", IDC_TITLE_LANGUAGE, 0, 68, 262, 36, WS_GROUP
 
-	GROUPBOX		"", IDC_TITLE_LANGUAGE, 0, 80, 262, 36, WS_GROUP
-
-	LTEXT			"", IDC_LANGUAGE_HINT, 8, 94, 114, 12, SS_CENTERIMAGE
-	COMBOBOX		IDC_LANGUAGE, 130, 94, 124, 30, CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+	LTEXT			"", IDC_LANGUAGE_HINT, 8, 82, 114, 12, SS_CENTERIMAGE
+	COMBOBOX		IDC_LANGUAGE, 130, 82, 124, 30, CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
 END
 
 IDD_SETTINGS_INTERFACE DIALOGEX 0, 0, 262, 172
@@ -816,6 +831,21 @@ BEGIN
 	IDS_USEDARKTHEME "Use dark theme"
 
 	IDS_KEEPUNUSED_CHK "Keep unused apps"
+	IDS_TAB_AUTOAPPS "Auto match"
+	IDS_AUTO_FILENAME "Executable name"
+	IDS_AUTO_DIRECTORY "Installation directory (optional)"
+	IDS_AUTO_PUBLISHER "Verified publisher (optional)"
+	IDS_AUTO_HINT "Desktop apps only. Enter an exact executable name (for example, blender.exe). The optional local directory includes subdirectories; the publisher must exactly match a trusted signature. All entered conditions must match. No wildcards."
+	IDS_AUTO_BLOCK_CHK "Exclude from automatic allow rules"
+	IDS_AUTO_APPS_HINT "Manual selections and automatic matches are combined. With no selections and no automatic name, the rule applies to all apps."
+	IDS_AUTO_ERROR_FILENAME "Enter a valid executable name, such as blender.exe. Paths and wildcards are not allowed."
+	IDS_AUTO_ERROR_DIRECTORY "Enter an absolute local directory, such as C:\\Program Files\\Example. Wildcards are not allowed."
+	IDS_AUTO_ERROR_REQUIRED "Enter an executable name before specifying a directory or publisher."
+	IDS_AUTO_ERROR_ACTION "Automatic matching is available only for allow rules."
+	IDS_AUTO_ERROR_PUBLISHER "Enter an exact publisher name without wildcards."
+	IDS_AUTO_ERROR_SERVICE "Automatic matching is available only for desktop app rules."
+	IDS_AUTO_APP_RULES_HINT "Checkboxes assign rules manually; automatic matches are set in each rule. Allow rules are unnecessary for apps already allowed."
+	IDS_AUTO_CLEARED_DISABLED "Automatic matching was removed and no apps are selected. The rule was disabled to prevent it from applying to all apps."
 END
 
 //

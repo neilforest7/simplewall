@@ -185,6 +185,19 @@ BOOLEAN _app_getappinfobyhash (
 	return is_success;
 }
 
+// The WFP helper retains filter IDs when revocation fails.
+static BOOLEAN _app_revokeappfilters (
+	_Inout_ PITEM_APP ptr_app
+)
+{
+	if (_wfp_destroyfilters_array (_wfp_getenginehandle (), ptr_app->guids, DBG_ARG))
+		return TRUE;
+
+	ptr_app->is_haveerrors = TRUE;
+	_r_show_message (_r_app_gethwnd (), MB_OK | MB_ICONERROR, NULL, L"Could not remove the application filters. Previous permissions may still be active. Retry the change or reapply filters.");
+	return FALSE;
+}
+
 VOID _app_setappinfo (
 	_In_ PITEM_APP ptr_app,
 	_In_ ENUM_INFO_DATA info_data,
@@ -223,7 +236,6 @@ VOID _app_setappinfo (
 
 		case INFO_TIMER:
 		{
-			HANDLE engine_handle;
 			LONG64 timestamp;
 
 			if (!value)
@@ -234,14 +246,11 @@ VOID _app_setappinfo (
 			// check timer expiration
 			if (timestamp <= _r_unixtime_now ())
 			{
-				engine_handle = _wfp_getenginehandle ();
-
-				_wfp_destroyfilters_array (engine_handle, ptr_app->guids, DBG_ARG);
-
-				_r_obj_cleararray (ptr_app->guids);
-
-				ptr_app->timer = 0;
-				ptr_app->is_enabled = FALSE;
+				if (_app_revokeappfilters (ptr_app))
+				{
+					ptr_app->timer = 0;
+					ptr_app->is_enabled = FALSE;
+				}
 			}
 			else
 			{
@@ -256,15 +265,8 @@ VOID _app_setappinfo (
 
 		case INFO_DISABLE:
 		{
-			HANDLE engine_handle;
-
-			ptr_app->is_enabled = FALSE;
-
-			engine_handle = _wfp_getenginehandle ();
-
-			_wfp_destroyfilters_array (engine_handle, ptr_app->guids, DBG_ARG);
-
-			_r_obj_cleararray (ptr_app->guids);
+			if (_app_revokeappfilters (ptr_app))
+				ptr_app->is_enabled = FALSE;
 
 			_app_listview_updateitemby_param (_r_app_gethwnd (), ptr_app->app_hash, TRUE);
 
@@ -394,7 +396,7 @@ ULONG_PTR _app_addapplication (
 {
 	WCHAR path_full[1024];
 	R_STRINGREF path_sr;
-	PITEM_APP ptr_app;
+	PITEM_APP ptr_app, existing_app;
 	ULONG_PTR app_hash;
 	BOOLEAN is_ntoskrnl;
 
@@ -483,11 +485,20 @@ ULONG_PTR _app_addapplication (
 	ptr_app->guids = _r_obj_createarray (sizeof (GUID), 4, NULL); // initialize array
 	ptr_app->timestamp = _r_unixtime_now ();
 
-	// insert object into the table
-	//
-	//_r_queuedlock_acquireexclusive (&lock_apps);
+	// Synchronize insertion with reference-owning application snapshots.
+	_r_queuedlock_acquireexclusive (&lock_apps);
+	existing_app = _r_obj_findhashtablepointer (apps_table, app_hash);
+
+	if (existing_app)
+	{
+		_r_queuedlock_releaseexclusive (&lock_apps);
+		_r_obj_dereference (existing_app);
+		_r_obj_dereference (ptr_app);
+		return app_hash;
+	}
 	_r_obj_addhashtablepointer (apps_table, app_hash, ptr_app);
-	//_r_queuedlock_releaseexclusive (&lock_apps);
+	_r_obj_reference (ptr_app); // caller reference must precede concurrent removal
+	_r_queuedlock_releaseexclusive (&lock_apps);
 
 	// insert item
 	if (hwnd)
@@ -497,6 +508,7 @@ ULONG_PTR _app_addapplication (
 	if (!_r_obj_isstringempty (ptr_app->real_path))
 		_app_getfileinformation (ptr_app->real_path, app_hash, ptr_app->type, _app_listview_getbytype (ptr_app->type));
 
+	_r_obj_dereference (ptr_app);
 	return app_hash;
 }
 
@@ -514,8 +526,9 @@ PITEM_RULE _app_addrule (
 
 	ptr_rule = _r_obj_allocate (sizeof (ITEM_RULE), &_app_dereferencerule);
 
-	ptr_rule->apps = _r_obj_createhashtable (sizeof (SHORT), 4, NULL); // initialize hashtable
-	ptr_rule->guids = _r_obj_createarray (sizeof (GUID), 4, NULL); // initialize array
+	ptr_rule->apps = _r_obj_createhashtable (sizeof (SHORT), 4, NULL);
+	ptr_rule->auto_apps = _r_obj_createhashtable (sizeof (SHORT), 4, NULL);
+	ptr_rule->guids = _r_obj_createarray (sizeof (GUID), 4, NULL);
 
 	ptr_rule->type = DATA_RULE_USER;
 
@@ -598,21 +611,10 @@ PITEM_RULE _app_getrulebyid (
 
 	_r_queuedlock_acquireshared (&lock_rules);
 
-	if (index < _r_obj_getlistsize (rules_list))
-	{
-		ptr_rule = _r_obj_getlistitem (rules_list, index);
-	}
-	else
-	{
-		ptr_rule = NULL;
-	}
-
+	ptr_rule = index < _r_obj_getlistsize (rules_list) ? _r_obj_referencesafe (_r_obj_getlistitem (rules_list, index)) : NULL;
 	_r_queuedlock_releaseshared (&lock_rules);
 
-	if (ptr_rule)
-		return _r_obj_reference (ptr_rule);
-
-	return NULL;
+	return ptr_rule;
 }
 
 _Ret_maybenull_
@@ -818,20 +820,21 @@ VOID _app_freeapplication (
 
 	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules_list); i++)
 	{
-		ptr_rule = _r_obj_getlistitem (rules_list, i);
+		ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules_list, i);
 
-		if (!ptr_rule)
+		if (!ptr_rule || ptr_rule->type != DATA_RULE_USER)
 			continue;
 
-		if (ptr_rule->type != DATA_RULE_USER)
-			continue;
+		_app_ruleremoveapp (hwnd, i, ptr_rule, app_hash);
 
-		if (hwnd)
-			_app_ruleremoveapp (hwnd, i, ptr_rule, app_hash);
+		_r_queuedlock_acquireexclusive (&lock_autoapps);
+		_r_obj_removehashtableitem (ptr_rule->auto_apps, app_hash);
+		_r_queuedlock_releaseexclusive (&lock_autoapps);
 	}
 
 	_r_queuedlock_releaseshared (&lock_rules);
 
+	// Caller holds lock_apps while removing the application.
 	_r_obj_removehashtableitem (apps_table, app_hash);
 }
 
@@ -875,7 +878,7 @@ VOID _app_getcount (
 
 		if (ptr_rule->type == DATA_RULE_USER)
 		{
-			if (ptr_rule->is_enabled && !_r_obj_isempty (ptr_rule->apps))
+			if (ptr_rule->is_enabled && _app_rule_isglobal (ptr_rule))
 				status->rules_global_count += 1;
 
 			if (ptr_rule->is_readonly)
@@ -902,16 +905,18 @@ COLORREF _app_getrulecolor (
 	PITEM_RULE ptr_rule;
 	ULONG_PTR color_hash = 0;
 
+	UNREFERENCED_PARAMETER (listview_id);
+
 	ptr_rule = _app_getrulebyid (rule_idx);
 
 	if (!ptr_rule)
 		return 0;
 
-	if (_r_config_getboolean_ex (L"IsHighlightInvalid", TRUE, L"colors") && ptr_rule->is_enabled && ptr_rule->is_haveerrors)
+	if (_r_config_getboolean_ex (L"IsHighlightInvalid", TRUE, L"colors") && ptr_rule->is_haveerrors)
 	{
 		color_hash = config.color_invalid;
 	}
-	else if (_r_config_getboolean_ex (L"IsHighlightSpecial", TRUE, L"colors") && (ptr_rule->is_forservices || !_r_obj_isempty (ptr_rule->apps)))
+	else if (_r_config_getboolean_ex (L"IsHighlightSpecial", TRUE, L"colors") && (ptr_rule->is_forservices || !_app_rule_isglobal (ptr_rule)))
 	{
 		color_hash = config.color_special;
 	}
@@ -958,6 +963,151 @@ VOID _app_setruleiteminfo (
 	{
 		_app_listview_updateitemby_param (hwnd, hash_code, TRUE);
 	}
+
+	if (_app_rule_hasauto (ptr_rule))
+		_app_listview_updateby_id (hwnd, DATA_APP_REGULAR, PR_UPDATE_FORCE | PR_UPDATE_TYPE);
+}
+
+BOOLEAN _app_rule_hasauto (
+	_In_ PITEM_RULE ptr_rule
+)
+{
+	// Presence is distinct from validity: malformed selectors must never be global.
+	return ptr_rule->auto_filename || ptr_rule->auto_directory || ptr_rule->auto_publisher;
+}
+
+BOOLEAN _app_rule_autoisvalid (
+	_In_ PITEM_RULE ptr_rule
+)
+{
+	if (ptr_rule->type != DATA_RULE_USER || ptr_rule->is_readonly || ptr_rule->action != FWP_ACTION_PERMIT || ptr_rule->is_forservices || ptr_rule->is_fordriver)
+		return FALSE;
+
+	if (!sw_autoallow_valid_filename (_r_obj_getstring (ptr_rule->auto_filename)))
+		return FALSE;
+
+	if (!_r_obj_isstringempty (ptr_rule->auto_directory) && !sw_autoallow_valid_directory (ptr_rule->auto_directory->buffer))
+		return FALSE;
+
+	if (!_r_obj_isstringempty (ptr_rule->auto_publisher) && _r_str_getlength2 (&ptr_rule->auto_publisher->sr) >= 1024)
+		return FALSE;
+
+	return TRUE;
+}
+
+BOOLEAN _app_rule_isglobal (
+	_In_ PITEM_RULE ptr_rule
+)
+{
+	return !ptr_rule->is_forservices && !ptr_rule->is_fordriver && !_app_rule_hasauto (ptr_rule) && _r_obj_isempty (ptr_rule->apps);
+}
+
+BOOLEAN _app_rule_issystemapp (
+	_In_ PITEM_RULE ptr_rule,
+	_In_ ULONG_PTR app_hash
+)
+{
+	return app_hash && ((ptr_rule->is_forservices && app_hash == config.svchost_hash) ||
+		(ptr_rule->is_fordriver && app_hash == config.ntoskrnl_hash));
+}
+
+BOOLEAN _app_rule_containsapp (
+	_In_ PITEM_RULE ptr_rule,
+	_In_ ULONG_PTR app_hash
+)
+{
+	BOOLEAN is_member;
+
+	if (_app_rule_issystemapp (ptr_rule, app_hash) || _r_obj_findhashtable (ptr_rule->apps, app_hash))
+		return TRUE;
+
+	_r_queuedlock_acquireshared (&lock_autoapps);
+	is_member = _app_rule_hasauto (ptr_rule) && !ptr_rule->is_haveerrors && (_r_obj_findhashtable (ptr_rule->auto_apps, app_hash) != NULL);
+	_r_queuedlock_releaseshared (&lock_autoapps);
+
+	return is_member;
+}
+
+BOOLEAN _app_rule_matchapp (
+	_In_ PITEM_RULE ptr_rule,
+	_In_ PITEM_APP ptr_app
+)
+{
+	// Never use service executables, packages, network/device paths, or Pico names.
+	if (!ptr_rule->is_enabled || !_app_rule_autoisvalid (ptr_rule) || ptr_app->type != DATA_APP_REGULAR || ptr_app->is_autoallow_blocked || _app_issystemhash (ptr_app->app_hash))
+		return FALSE;
+
+	return sw_autoallow_match (_r_obj_getstring (ptr_app->real_path), ptr_rule->auto_filename->buffer,
+		_r_obj_getstring (ptr_rule->auto_directory), _r_obj_getstring (ptr_rule->auto_publisher)) != FALSE;
+}
+
+// Caller serializes rule selector edits/rebuilds with lock_autoallow. The app
+// snapshot owns references, so file and signature IO runs outside lock_apps.
+BOOLEAN _app_rule_refresh_autoapps (
+	_In_ PITEM_RULE ptr_rule
+)
+{
+	PR_HASHTABLE matches, previous;
+	PR_LIST applications;
+	PITEM_APP ptr_app = NULL;
+	ULONG_PTR enum_key = 0;
+	ULONG_PTR app_hash;
+	BOOLEAN is_changed = FALSE;
+
+	matches = _r_obj_createhashtable (sizeof (SHORT), 0x02, NULL);
+
+	if (ptr_rule->is_enabled && _app_rule_autoisvalid (ptr_rule))
+	{
+		applications = _r_obj_createlist (0x10, &_r_obj_dereference);
+
+		_r_queuedlock_acquireshared (&lock_apps);
+
+		while (_r_obj_enumhashtablepointer (apps_table, (PVOID_PTR)&ptr_app, NULL, &enum_key))
+		{
+			if (ptr_app->type == DATA_APP_REGULAR && !ptr_app->is_autoallow_blocked)
+				_r_obj_addlistitem (applications, _r_obj_reference (ptr_app));
+		}
+
+		_r_queuedlock_releaseshared (&lock_apps);
+
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (applications); i++)
+		{
+			ptr_app = (PITEM_APP)_r_obj_getlistitem (applications, i);
+
+			if (_app_rule_matchapp (ptr_rule, ptr_app))
+				_r_obj_addhashtableitem (matches, ptr_app->app_hash, NULL);
+		}
+
+		_r_obj_dereference (applications);
+	}
+
+	_r_queuedlock_acquireexclusive (&lock_autoapps);
+
+	previous = ptr_rule->auto_apps;
+	enum_key = 0;
+
+	while (_r_obj_enumhashtable (matches, NULL, &app_hash, &enum_key))
+	{
+		if (!_r_obj_findhashtable (previous, app_hash))
+			is_changed = TRUE;
+	}
+
+	enum_key = 0;
+
+	while (_r_obj_enumhashtable (previous, NULL, &app_hash, &enum_key))
+	{
+		if (!_r_obj_findhashtable (matches, app_hash))
+			is_changed = TRUE;
+	}
+
+	ptr_rule->auto_apps = matches;
+
+	_r_queuedlock_releaseexclusive (&lock_autoapps);
+
+	if (previous)
+		_r_obj_dereference (previous);
+
+	return is_changed;
 }
 
 VOID _app_ruleenable (
@@ -968,6 +1118,9 @@ VOID _app_ruleenable (
 {
 	PITEM_RULE_CONFIG ptr_config;
 	ULONG_PTR rule_hash;
+
+	if (is_enable && _app_rule_hasauto (ptr_rule) && !_app_rule_autoisvalid (ptr_rule))
+		is_enable = FALSE;
 
 	ptr_rule->is_enabled = is_enable;
 
@@ -1011,7 +1164,7 @@ VOID _app_ruleremoveapp (
 	if (!_r_obj_removehashtableitem (ptr_rule->apps, app_hash))
 		return;
 
-	if (ptr_rule->is_enabled && _r_obj_isempty (ptr_rule->apps))
+	if (ptr_rule->is_enabled && _app_rule_isglobal (ptr_rule))
 	{
 		ptr_rule->is_enabled = FALSE;
 		ptr_rule->is_haveerrors = FALSE;
@@ -1136,7 +1289,7 @@ VOID _app_ruleblocklistset (
 				{
 					hengine = _wfp_getenginehandle ();
 
-					_wfp_create4filters (hengine, rules, DBG_ARG, FALSE);
+					_wfp_createrulefilters (hengine, rules, DBG_ARG, FALSE);
 				}
 			}
 		}
@@ -1168,10 +1321,7 @@ PR_STRING _app_appexpandrules (
 	{
 		ptr_rule = _r_obj_getlistitem (rules_list, i);
 
-		if (!ptr_rule)
-			continue;
-
-		if (ptr_rule->is_enabled && ptr_rule->type == DATA_RULE_USER && !_r_obj_isstringempty (ptr_rule->name) && _r_obj_findhashtable (ptr_rule->apps, app_hash))
+		if (ptr_rule && ptr_rule->is_enabled && ptr_rule->type == DATA_RULE_USER && !_r_obj_isstringempty (ptr_rule->name) && _app_rule_containsapp (ptr_rule, app_hash))
 		{
 			_r_obj_appendstringbuilder2 (&buffer, &ptr_rule->name->sr);
 
@@ -1198,10 +1348,11 @@ PR_STRING _app_appexpandrules (
 }
 
 _Ret_maybenull_
-PR_STRING _app_rulesexpandapps (
+static PR_STRING _app_rulesexpandapps_internal (
 	_In_ PITEM_RULE ptr_rule,
 	_In_ BOOLEAN is_fordisplay,
-	_In_ LPWSTR delimeter
+	_In_ LPWSTR delimeter,
+	_In_ BOOLEAN apps_locked
 )
 {
 	R_STRINGREF delimeter_sr;
@@ -1210,29 +1361,50 @@ PR_STRING _app_rulesexpandapps (
 	PR_STRING string;
 	ULONG_PTR enum_key = 0;
 	ULONG_PTR hash_code;
+	PR_HASHTABLE display_apps = NULL;
 
 	_r_obj_initializestringbuilder (&sr, 256);
 
 	_r_obj_initializestringref (&delimeter_sr, delimeter);
 
-	if (is_fordisplay && ptr_rule->is_forservices)
+	if (is_fordisplay && ptr_rule->is_fordriver)
 	{
-		string = _r_obj_concatstrings (
-			4,
-			PROC_SYSTEM_NAME,
-			delimeter,
-			_r_obj_getstring (config.svchost_path),
-			delimeter
-		);
-
-		_r_obj_appendstringbuilder2 (&sr, &string->sr);
-
-		_r_obj_dereference (string);
+		_r_obj_appendstringbuilder (&sr, PROC_SYSTEM_NAME);
+		_r_obj_appendstringbuilder2 (&sr, &delimeter_sr);
 	}
 
-	while (_r_obj_enumhashtable (ptr_rule->apps, NULL, &hash_code, &enum_key))
+	if (is_fordisplay && ptr_rule->is_forservices)
 	{
-		ptr_app = _app_getappitem (hash_code);
+		_r_obj_appendstringbuilder (&sr, _r_obj_getstringorempty (config.svchost_path));
+		_r_obj_appendstringbuilder2 (&sr, &delimeter_sr);
+	}
+
+	if (is_fordisplay)
+	{
+		display_apps = _r_obj_createhashtable (sizeof (SHORT), 0x02, NULL);
+
+		while (_r_obj_enumhashtable (ptr_rule->apps, NULL, &hash_code, &enum_key))
+			_r_obj_addhashtableitem (display_apps, hash_code, NULL);
+
+		enum_key = 0;
+		_r_queuedlock_acquireshared (&lock_autoapps);
+
+		if (_app_rule_hasauto (ptr_rule) && !ptr_rule->is_haveerrors)
+		{
+			while (_r_obj_enumhashtable (ptr_rule->auto_apps, NULL, &hash_code, &enum_key))
+				_r_obj_addhashtableitem (display_apps, hash_code, NULL);
+		}
+
+		_r_queuedlock_releaseshared (&lock_autoapps);
+		enum_key = 0;
+	}
+
+	while (_r_obj_enumhashtable (display_apps ? display_apps : ptr_rule->apps, NULL, &hash_code, &enum_key))
+	{
+		if (is_fordisplay && _app_rule_issystemapp (ptr_rule, hash_code))
+			continue;
+
+		ptr_app = apps_locked ? _r_obj_findhashtablepointer (apps_table, hash_code) : _app_getappitem (hash_code);
 
 		if (!ptr_app)
 			continue;
@@ -1271,6 +1443,9 @@ PR_STRING _app_rulesexpandapps (
 		_r_obj_dereference (ptr_app);
 	}
 
+	if (display_apps)
+		_r_obj_dereference (display_apps);
+
 	string = _r_obj_finalstringbuilder (&sr);
 
 	_r_str_trimstring (&string->sr, &delimeter_sr, PR_TRIM_END_ONLY);
@@ -1281,6 +1456,25 @@ PR_STRING _app_rulesexpandapps (
 	_r_obj_deletestringbuilder (&sr);
 
 	return NULL;
+}
+
+_Ret_maybenull_
+PR_STRING _app_rulesexpandapps (
+	_In_ PITEM_RULE ptr_rule,
+	_In_ BOOLEAN is_fordisplay,
+	_In_ LPWSTR delimeter
+)
+{
+	return _app_rulesexpandapps_internal (ptr_rule, is_fordisplay, delimeter, FALSE);
+}
+
+_Ret_maybenull_
+PR_STRING _app_rulesexpandapps_locked (
+	_In_ PITEM_RULE ptr_rule,
+	_In_ LPWSTR delimeter
+)
+{
+	return _app_rulesexpandapps_internal (ptr_rule, FALSE, delimeter, TRUE);
 }
 
 _Ret_maybenull_
@@ -1398,7 +1592,7 @@ BOOLEAN _app_isapphaverule (
 		{
 			if (ptr_rule->type == DATA_RULE_USER && (is_countdisabled || ptr_rule->is_enabled))
 			{
-				if (_r_obj_findhashtable (ptr_rule->apps, app_hash))
+				if (_app_rule_containsapp (ptr_rule, app_hash))
 				{
 					_r_queuedlock_releaseshared (&lock_rules);
 
@@ -1481,13 +1675,7 @@ BOOLEAN _app_isappused (
 	_In_ PITEM_APP ptr_app
 )
 {
-	if (ptr_app->is_enabled || ptr_app->is_silent || ptr_app->is_undeletable)
-		return TRUE;
-
-	if (_app_isapphaverule (ptr_app->app_hash, TRUE))
-		return TRUE;
-
-	return FALSE;
+	return (ptr_app->is_enabled || ptr_app->is_silent || ptr_app->is_undeletable || ptr_app->is_autoallow_blocked || _app_isapphaverule (ptr_app->app_hash, TRUE)) ? TRUE : FALSE;
 }
 
 BOOLEAN _app_issystemhash (
@@ -1560,7 +1748,7 @@ NTSTATUS _app_profile_load_fromresource (
 		status = _r_res_loadresource (_r_sys_getimagebase (), RT_RCDATA, resource_name, 0, &bytes);
 
 		if (NT_SUCCESS (status))
-			status = _app_db_openfrombuffer (db_info, &bytes, XML_VERSION_MAXIMUM, XML_TYPE_PROFILE_INTERNAL);
+			status = _app_db_openfrombuffer (db_info, &bytes, XML_VERSION_INTERNAL_MINIMUM, XML_TYPE_PROFILE_INTERNAL);
 	}
 
 	return status;
@@ -1615,7 +1803,7 @@ VOID _app_profile_load_internal (
 	if (_r_fs_exists (&path->sr))
 	{
 		if (NT_SUCCESS (status_file))
-			status_file = _app_db_openfromfile (&db_info_file, path, XML_VERSION_MAXIMUM, XML_TYPE_PROFILE_INTERNAL);
+			status_file = _app_db_openfromfile (&db_info_file, path, XML_VERSION_INTERNAL_MINIMUM, XML_TYPE_PROFILE_INTERNAL);
 	}
 	else
 	{
@@ -1664,6 +1852,8 @@ VOID _app_profile_refresh (
 	_In_opt_ HWND hwnd
 )
 {
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
+
 	// clear apps
 	_r_queuedlock_acquireexclusive (&lock_apps);
 	_r_obj_clearhashtable (apps_table);
@@ -1678,6 +1868,8 @@ VOID _app_profile_refresh (
 	_r_queuedlock_acquireexclusive (&lock_rules_config);
 	_r_obj_clearhashtable (rules_config);
 	_r_queuedlock_releaseexclusive (&lock_rules_config);
+
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
 
 	if (!hwnd)
 		hwnd = _r_app_gethwnd ();
@@ -1696,6 +1888,8 @@ NTSTATUS _app_profile_load (
 )
 {
 	DB_INFORMATION db_info;
+	PR_LIST rules;
+	PITEM_RULE ptr_rule;
 	NTSTATUS status;
 	BOOLEAN is_update;
 
@@ -1761,6 +1955,26 @@ CleanupExit:
 			_app_profile_load_internal (hwnd, profile_info.profile_path_internal, MAKEINTRESOURCE (IDR_PROFILE_INTERNAL), &profile_info.profile_internal_timestamp);
 
 		_app_profile_load_fallback ();
+
+		rules = _r_obj_createlist (0x10, &_r_obj_dereference);
+		_r_queuedlock_acquireexclusive (&lock_autoallow);
+		_r_queuedlock_acquireshared (&lock_rules);
+
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules_list); i++)
+		{
+			ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules_list, i);
+
+			if (ptr_rule && _app_rule_hasauto (ptr_rule))
+				_r_obj_addlistitem (rules, _r_obj_reference (ptr_rule));
+		}
+
+		_r_queuedlock_releaseshared (&lock_rules);
+
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
+			_app_rule_refresh_autoapps ((PITEM_RULE)_r_obj_getlistitem (rules, i));
+
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
+		_r_obj_dereference (rules);
 
 		if (hwnd)
 			_app_listview_additems (hwnd);

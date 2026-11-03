@@ -7,6 +7,13 @@
 DEFINE_GUID (GUID_WfpProvider, 0xb0d553e2, 0xc6a0, 0x4a9a, 0xae, 0xb8, 0xc7, 0x52, 0x48, 0x3e, 0xd6, 0x2f);
 DEFINE_GUID (GUID_WfpSublayer, 0x9fee6f59, 0xb951, 0x4f9a, 0xb5, 0x2f, 0x13, 0x3d, 0xcf, 0x7a, 0x42, 0x79);
 
+#define WM_WFP_WARNING (WM_APP + 22)
+#define WFP_WARNING_TIMER 0x57465057
+
+VOID _wfp_warnruleupdate (_In_opt_ HWND hwnd);
+VOID _wfp_schedulewarning ();
+VOID _wfp_showwarning (_In_ HWND hwnd);
+
 // filter names
 #define FW_NAME_BLOCK_CONNECTION L"BlockConnection"
 #define FW_NAME_BLOCK_RECVACCEPT L"BlockRecvAccept"
@@ -82,7 +89,9 @@ ULONG _wfp_createcallout (
 
 BOOLEAN _wfp_deletefilter (
 	_In_ HANDLE engine_handle,
-	_In_ LPGUID filter_id
+	_In_ LPCGUID filter_id,
+	_In_ LPCWSTR file_name,
+	_In_ ULONG line
 );
 
 ULONG _wfp_createfilter (
@@ -105,9 +114,9 @@ VOID _wfp_destroyfilters (
 	_In_ HANDLE engine_handle
 );
 
-VOID _wfp_destroyfilters_array (
+BOOLEAN _wfp_destroyfilters_array (
 	_In_ HANDLE engine_handle,
-	_In_ PR_ARRAY guids,
+	_Inout_ PR_ARRAY guids,
 	_In_ LPCWSTR file_name,
 	_In_ ULONG line
 );
@@ -126,7 +135,9 @@ BOOLEAN _wfp_createrulefilter (
 	_Inout_opt_ PR_ARRAY guids
 );
 
-BOOLEAN _wfp_create4filters (
+BOOLEAN _wfp_autoallow_app (_In_opt_ HWND hwnd, _In_ PITEM_APP ptr_app, _In_ PITEM_LOG ptr_log);
+
+BOOLEAN _wfp_createrulefilters (
 	_In_ HANDLE engine_handle,
 	_In_ PR_LIST rules,
 	_In_ LPCWSTR file_name,
@@ -134,7 +145,7 @@ BOOLEAN _wfp_create4filters (
 	_In_ BOOLEAN is_intransact
 );
 
-BOOLEAN _wfp_create3filters (
+BOOLEAN _wfp_createappfilters (
 	_In_ HANDLE engine_handle,
 	_In_ PR_LIST rules,
 	_In_ LPCWSTR file_name,
@@ -142,7 +153,7 @@ BOOLEAN _wfp_create3filters (
 	_In_ BOOLEAN is_intransact
 );
 
-BOOLEAN _wfp_create2filters (
+BOOLEAN _wfp_createglobalfilters (
 	_In_ HANDLE engine_handle,
 	_In_ LPCWSTR file_name,
 	_In_ ULONG line,

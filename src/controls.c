@@ -351,7 +351,7 @@ PR_STRING _app_gettooltipbylparam (
 				_r_obj_dereference (string2);
 
 			// rule apps
-			if (ptr_rule->is_forservices || !_r_obj_isempty (ptr_rule->apps))
+			if (!_app_rule_isglobal (ptr_rule))
 			{
 				string1 = _app_rulesexpandapps (ptr_rule, TRUE, SZ_TAB_CRLF);
 

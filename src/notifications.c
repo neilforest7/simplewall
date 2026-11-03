@@ -86,7 +86,10 @@ BOOLEAN _app_notify_command (
 
 	if (button_id == IDC_ALLOW_BTN || button_id == IDC_BLOCK_BTN)
 	{
+		_r_queuedlock_acquireexclusive (&lock_autoallow);
 		ptr_app->is_enabled = (button_id == IDC_ALLOW_BTN);
+		ptr_app->is_autoallow_blocked = (button_id == IDC_BLOCK_BTN);
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
 		ptr_app->is_silent = (button_id == IDC_BLOCK_BTN);
 
 		if (ptr_app->is_enabled && seconds)
@@ -117,9 +120,12 @@ BOOLEAN _app_notify_command (
 		{
 			hengine = _wfp_getenginehandle ();
 
-			_wfp_create3filters (hengine, rules, DBG_ARG, FALSE);
+			_wfp_createappfilters (hengine, rules, DBG_ARG, FALSE);
 		}
 	}
+
+	if (button_id == IDC_ALLOW_BTN || button_id == IDC_BLOCK_BTN)
+		_app_autoallow_refresh (_r_app_gethwnd ());
 
 	_app_listview_updateby_id (_r_app_gethwnd (), ptr_app->type, PR_UPDATE_TYPE);
 
@@ -1349,15 +1355,22 @@ INT_PTR CALLBACK NotificationProc (
 
 				_app_notify_freeobject (hwnd, ptr_app);
 
-				if (!(ptr_rule->is_forservices && _app_issystemhash (app_hash)))
+				if (!(_app_rule_issystemapp (ptr_rule, app_hash)))
 				{
-					is_remove = ptr_rule->is_enabled && _r_obj_findhashtable (ptr_rule->apps, app_hash);
+					_r_queuedlock_acquireexclusive (&lock_autoallow);
+
+					is_remove = ptr_rule->is_enabled && _app_rule_containsapp (ptr_rule, app_hash);
 
 					if (is_remove)
 					{
+						if (_app_rule_hasauto (ptr_rule))
+						{
+							ptr_app->is_autoallow_blocked = TRUE;
+						}
+
 						_r_obj_removehashtableitem (ptr_rule->apps, app_hash);
 
-						if (_r_obj_isempty (ptr_rule->apps))
+						if (_app_rule_isglobal (ptr_rule))
 							_app_ruleenable (ptr_rule, FALSE, TRUE);
 					}
 					else
@@ -1366,6 +1379,8 @@ INT_PTR CALLBACK NotificationProc (
 
 						_app_ruleenable (ptr_rule, TRUE, TRUE);
 					}
+
+					_r_queuedlock_releaseexclusive (&lock_autoallow);
 
 					_app_listview_updateitemby_param (_r_app_gethwnd (), app_hash, TRUE);
 					_app_listview_updateitemby_param (_r_app_gethwnd (), rule_idx, FALSE);
@@ -1378,10 +1393,13 @@ INT_PTR CALLBACK NotificationProc (
 
 						_r_obj_addlistitem (rules, ptr_rule);
 
-						_wfp_create4filters (hengine, rules, DBG_ARG, FALSE);
+						_wfp_createrulefilters (hengine, rules, DBG_ARG, FALSE);
 
 						_r_obj_dereference (rules);
 					}
+
+					if (_app_rule_hasauto (ptr_rule))
+						_app_autoallow_refresh (_r_app_gethwnd ());
 
 					_app_listview_updateby_id (_r_app_gethwnd (), DATA_LISTVIEW_CURRENT, PR_UPDATE_TYPE);
 

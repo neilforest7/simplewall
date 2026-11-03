@@ -178,13 +178,6 @@ VOID _app_config_apply (
 			break;
 		}
 
-		case IDC_CHECKUPDATES_CHK:
-		case IDM_CHECKUPDATES_CHK:
-		{
-			new_val = !_r_update_isenabled (FALSE);
-			break;
-		}
-
 		case IDC_RULE_BLOCKOUTBOUND:
 		case IDM_RULE_BLOCKOUTBOUND:
 		{
@@ -326,16 +319,6 @@ VOID _app_config_apply (
 
 			if (hsettings)
 				_r_ctrl_checkbutton (hsettings, IDC_SKIPUACWARNING_CHK, is_enabled);
-
-			break;
-		}
-
-		case IDC_CHECKUPDATES_CHK:
-		case IDM_CHECKUPDATES_CHK:
-		{
-			_r_update_enable (new_val);
-
-			_r_menu_checkitem (hmenu, IDM_CHECKUPDATES_CHK, 0, MF_BYCOMMAND, new_val);
 
 			break;
 		}
@@ -546,8 +529,6 @@ VOID _app_config_apply (
 		case IDC_STARTMINIMIZED_CHK:
 		case IDM_SKIPUACWARNING_CHK:
 		case IDC_SKIPUACWARNING_CHK:
-		case IDM_CHECKUPDATES_CHK:
-		case IDC_CHECKUPDATES_CHK:
 		case IDM_PROFILETYPE_PLAIN:
 		case IDM_PROFILETYPE_COMPRESSED:
 		case IDM_PROFILETYPE_ENCRYPTED:
@@ -597,8 +578,6 @@ INT_PTR CALLBACK SettingsProc (
 #if defined(APP_HAVE_SKIPUAC)
 					_r_ctrl_checkbutton (hwnd, IDC_SKIPUACWARNING_CHK, _r_skipuac_isenabled ());
 #endif // APP_HAVE_SKIPUAC
-
-					_r_ctrl_checkbutton (hwnd, IDC_CHECKUPDATES_CHK, _r_update_isenabled (FALSE));
 
 					_r_locale_enum (hwnd, IDC_LANGUAGE, 0);
 
@@ -904,8 +883,6 @@ INT_PTR CALLBACK SettingsProc (
 					_r_ctrl_setstring (hwnd, IDC_LOADONSTARTUP_CHK, _r_locale_getstring (IDS_LOADONSTARTUP_CHK));
 					_r_ctrl_setstring (hwnd, IDC_STARTMINIMIZED_CHK, _r_locale_getstring (IDS_STARTMINIMIZED_CHK));
 					_r_ctrl_setstring (hwnd, IDC_SKIPUACWARNING_CHK, _r_locale_getstring (IDS_SKIPUACWARNING_CHK));
-					_r_ctrl_setstring (hwnd, IDC_CHECKUPDATES_CHK, _r_locale_getstring (IDS_CHECKUPDATES_CHK));
-
 					_r_ctrl_setstring (hwnd, IDC_LANGUAGE_HINT, _r_locale_getstring (IDS_LANGUAGE_HINT));
 
 					break;
@@ -1427,7 +1404,6 @@ INT_PTR CALLBACK SettingsProc (
 				case IDC_LOADONSTARTUP_CHK:
 				case IDC_STARTMINIMIZED_CHK:
 				case IDC_SKIPUACWARNING_CHK:
-				case IDC_CHECKUPDATES_CHK:
 				case IDC_RULE_BLOCKOUTBOUND:
 				case IDC_RULE_BLOCKINBOUND:
 				case IDC_RULE_ALLOWLOOPBACK:
@@ -2158,11 +2134,14 @@ INT_PTR CALLBACK DlgProc (
 	_In_ LPARAM lparam
 )
 {
+	// Retry a pending report if posting and the timer both previously failed.
+	if (msg != WM_INITDIALOG && msg != WM_DESTROY && msg != WM_NCDESTROY)
+		_wfp_schedulewarning ();
+
 	switch (msg)
 	{
 		case WM_INITDIALOG:
 		{
-			WCHAR internal_profile_version[64];
 			ENUM_INSTALL_TYPE install_type;
 			LONG dpi_value;
 
@@ -2224,20 +2203,13 @@ INT_PTR CALLBACK DlgProc (
 			_r_settings_addpage (IDD_SETTINGS_LOGGING, IDS_TITLE_LOGGING);
 			_r_settings_addpage (IDD_SETTINGS_EXCLUDE, IDS_TITLE_EXCLUDE);
 
-			// add blocklist to update
-			if (!_r_config_getboolean (L"IsInternalRulesDisabled", FALSE))
-			{
-				_r_str_fromlong64 (internal_profile_version, RTL_NUMBER_OF (internal_profile_version), profile_info.profile_internal_timestamp);
-
-				_r_update_addcomponent (L"Internal rules", L"rules_internal", internal_profile_version, profile_info.profile_path_internal, FALSE);
-			}
-
 			_app_network_initialize (hwnd);
 
 			// initialize tab
 			_app_settab_id (hwnd, _r_config_getlong (L"CurrentTab", IDC_APPS_PROFILE));
 
 			_app_fileloggingenable ();
+			_wfp_schedulewarning ();
 
 			break;
 		}
@@ -2346,6 +2318,22 @@ INT_PTR CALLBACK DlgProc (
 				}
 			}
 
+			break;
+		}
+
+		case WM_WFP_WARNING:
+		{
+			_wfp_showwarning (hwnd);
+			return TRUE;
+		}
+
+		case WM_TIMER:
+		{
+			if (wparam == WFP_WARNING_TIMER)
+			{
+				_wfp_showwarning (hwnd);
+				return TRUE;
+			}
 			break;
 		}
 
@@ -2755,11 +2743,16 @@ INT_PTR CALLBACK DlgProc (
 					INT listview_id;
 					BOOLEAN is_changed = FALSE;
 					BOOLEAN is_enabled;
+					BOOLEAN auto_block_changed;
+					BOOLEAN old_enabled, old_auto_blocked, is_rebuild_failed;
 
 					lpnmlv = (LPNMLISTVIEW)lparam;
 					listview_id = (INT)(INT_PTR)lpnmlv->hdr.idFrom;
 
 					if ((lpnmlv->uChanged & LVIF_STATE) == 0)
+						break;
+
+					if (((lpnmlv->uOldState ^ lpnmlv->uNewState) & LVIS_STATEIMAGEMASK) == 0)
 						break;
 
 					if ((lpnmlv->uNewState & LVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK (1) || ((lpnmlv->uNewState & LVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK (2)))
@@ -2777,32 +2770,47 @@ INT_PTR CALLBACK DlgProc (
 							if (!ptr_app)
 								break;
 
-							if (ptr_app->is_enabled != is_enabled)
+							if (ptr_app->is_enabled != is_enabled || ptr_app->is_autoallow_blocked == is_enabled)
 							{
+								_r_queuedlock_acquireexclusive (&lock_autoallow);
+								old_enabled = !!ptr_app->is_enabled;
+								old_auto_blocked = !!ptr_app->is_autoallow_blocked;
+								auto_block_changed = (old_auto_blocked != !is_enabled);
+								ptr_app->is_autoallow_blocked = !is_enabled;
 								ptr_app->is_enabled = is_enabled;
+								_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+								is_rebuild_failed = FALSE;
+								if (_wfp_isfiltersinstalled ())
+								{
+									hengine = _wfp_getenginehandle ();
+									rules = _r_obj_createlist (1, NULL);
+									_r_obj_addlistitem (rules, ptr_app);
+									is_rebuild_failed = !_wfp_createappfilters (hengine, rules, DBG_ARG, FALSE);
+									_r_obj_dereference (rules);
+								}
+
+								if (is_rebuild_failed)
+								{
+									_r_queuedlock_acquireexclusive (&lock_autoallow);
+									ptr_app->is_enabled = old_enabled;
+									ptr_app->is_autoallow_blocked = old_auto_blocked;
+									_r_queuedlock_releaseexclusive (&lock_autoallow);
+									_wfp_warnruleupdate (hwnd);
+								}
+								else
+								{
+									if (is_enabled)
+										_app_notify_freeobject (NULL, ptr_app);
+									if (!is_enabled && _app_istimerset (ptr_app))
+										_app_timer_reset (hwnd, ptr_app);
+									if (auto_block_changed)
+										_app_autoallow_refresh (hwnd);
+								}
 
 								_app_listview_lock (hwnd, listview_id, TRUE);
 								_app_setappiteminfo (hwnd, listview_id, lpnmlv->iItem, ptr_app);
 								_app_listview_lock (hwnd, listview_id, FALSE);
-
-								if (is_enabled)
-									_app_notify_freeobject (NULL, ptr_app);
-
-								if (!is_enabled && _app_istimerset (ptr_app))
-									_app_timer_reset (hwnd, ptr_app);
-
-								if (_wfp_isfiltersinstalled ())
-								{
-									hengine = _wfp_getenginehandle ();
-
-									rules = _r_obj_createlist (1, NULL);
-
-									_r_obj_addlistitem (rules, ptr_app);
-
-									_wfp_create3filters (hengine, rules, DBG_ARG, FALSE);
-
-									_r_obj_dereference (rules);
-								}
 
 								is_changed = TRUE;
 							}
@@ -2819,25 +2827,36 @@ INT_PTR CALLBACK DlgProc (
 
 							if (ptr_rule->is_enabled != is_enabled)
 							{
-								_app_listview_lock (hwnd, listview_id, TRUE);
-
+								_r_queuedlock_acquireexclusive (&lock_autoallow);
+								old_enabled = !!ptr_rule->is_enabled;
 								_app_ruleenable (ptr_rule, is_enabled, TRUE);
-								_app_setruleiteminfo (hwnd, listview_id, lpnmlv->iItem, ptr_rule, TRUE);
+								is_rebuild_failed = (ptr_rule->is_enabled != is_enabled);
+								_r_queuedlock_releaseexclusive (&lock_autoallow);
 
-								_app_listview_lock (hwnd, listview_id, FALSE);
-
-								if (_wfp_isfiltersinstalled ())
+								if (!is_rebuild_failed && _wfp_isfiltersinstalled ())
 								{
 									hengine = _wfp_getenginehandle ();
-
 									rules = _r_obj_createlist (1, NULL);
-
 									_r_obj_addlistitem (rules, ptr_rule);
-
-									_wfp_create4filters (hengine, rules, DBG_ARG, FALSE);
-
+									is_rebuild_failed = !_wfp_createrulefilters (hengine, rules, DBG_ARG, FALSE);
 									_r_obj_dereference (rules);
 								}
+
+								if (is_rebuild_failed)
+								{
+									if (!is_enabled)
+									{
+										_r_queuedlock_acquireexclusive (&lock_autoallow);
+										_app_ruleenable (ptr_rule, old_enabled, TRUE);
+										_r_queuedlock_releaseexclusive (&lock_autoallow);
+									}
+									ptr_rule->is_haveerrors = TRUE;
+									_wfp_warnruleupdate (hwnd);
+								}
+
+								_app_listview_lock (hwnd, listview_id, TRUE);
+								_app_setruleiteminfo (hwnd, listview_id, lpnmlv->iItem, ptr_rule, TRUE);
+								_app_listview_lock (hwnd, listview_id, FALSE);
 
 								is_changed = TRUE;
 							}
@@ -3119,12 +3138,6 @@ INT_PTR CALLBACK DlgProc (
 				case IDM_TRAY_WEBSITE:
 				{
 					_r_shell_opendefault (_r_app_getwebsite_url ());
-					break;
-				}
-
-				case IDM_CHECKUPDATES:
-				{
-					_r_update_check (hwnd);
 					break;
 				}
 
@@ -3413,7 +3426,6 @@ INT_PTR CALLBACK DlgProc (
 				case IDM_LOADONSTARTUP_CHK:
 				case IDM_STARTMINIMIZED_CHK:
 				case IDM_SKIPUACWARNING_CHK:
-				case IDM_CHECKUPDATES_CHK:
 				case IDM_RULE_BLOCKOUTBOUND:
 				case IDM_RULE_BLOCKINBOUND:
 				case IDM_RULE_ALLOWLOOPBACK:

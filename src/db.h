@@ -21,6 +21,9 @@ typedef enum _ENUM_VERSION_XML
 
 	// v3.7: added hashes support, use encrypted file format and added comments for apps/rules
 	XML_VERSION_5 = 5,
+
+	// v6 separates service-host and kernel-driver rule scopes.
+	XML_VERSION_6 = 6,
 } ENUM_VERSION_XML;
 
 typedef struct _DB_INFORMATION
@@ -49,7 +52,8 @@ static const BYTE profile2_fourcc[] = {
 
 #define XML_VERSION_MINIMAL XML_VERSION_3
 #define XML_VERSION_CURRENT XML_VERSION_4
-#define XML_VERSION_MAXIMUM XML_VERSION_5
+#define XML_VERSION_MAXIMUM XML_VERSION_6
+#define XML_VERSION_INTERNAL_MINIMUM XML_VERSION_5
 
 #define XML_PROFILE_FILE L"profile.xml"
 #define XML_PROFILE_INTERNAL L"profile_internal.xml"
@@ -154,7 +158,8 @@ VOID _app_db_parse_app (
 
 VOID _app_db_parse_rule (
 	_Inout_ PDB_INFORMATION db_info,
-	_In_ ENUM_TYPE_DATA type
+	_In_ ENUM_TYPE_DATA type,
+	_In_ BOOLEAN is_automatic
 );
 
 VOID _app_db_parse_ruleconfig (
@@ -180,6 +185,7 @@ VOID _app_db_save_app (
 	_Inout_ PDB_INFORMATION db_info
 );
 
+// Caller holds lock_autoallow shared across app and rule serialization.
 VOID _app_db_save_rule (
 	_Inout_ PDB_INFORMATION db_info
 );
