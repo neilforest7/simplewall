@@ -16,7 +16,7 @@ The script copies the executable and built language file into a fresh directory 
 creates a portable English configuration, and starts the GUI with `-portable`.
 It checks that the process and the simplewall WFP provider, sublayer, provider
 callouts, and provider/sublayer filters are absent before startup. It opens the
-actual new-rule editor, uses UI Automation to select Auto match, checks the
+actual new-rule editor, reads and clicks the native Auto match tab, checks the
 publisher-without-filename warning, and saves two enabled allow rules: one with
 both filename and publisher, and one with filename only. After a clean exit it
 reads the portable profile and checks both records under `rules_auto`.

@@ -28,9 +28,78 @@ public static class GuiNative {
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr h);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, string s);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, StringBuilder s);
+    [DllImport("user32.dll", EntryPoint="SendMessageW")] static extern IntPtr SendMessageValue(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
     [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr VirtualAllocEx(IntPtr p, IntPtr address, UIntPtr size, uint allocation, uint protection);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool VirtualFreeEx(IntPtr p, IntPtr address, UIntPtr size, uint freeType);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool WriteProcessMemory(IntPtr p, IntPtr address, byte[] data, UIntPtr size, out UIntPtr written);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool ReadProcessMemory(IntPtr p, IntPtr address, byte[] data, UIntPtr size, out UIntPtr read);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [StructLayout(LayoutKind.Sequential)] struct TabItem {
+        public uint mask, state, stateMask;
+        public IntPtr text;
+        public int textMax, image;
+        public IntPtr value;
+    }
+    static byte[] BytesOf<T>(T value) {
+        int size = Marshal.SizeOf(typeof(T));
+        IntPtr p = Marshal.AllocHGlobal(size);
+        try { Marshal.StructureToPtr(value, p, false); byte[] bytes = new byte[size]; Marshal.Copy(p, bytes, 0, size); return bytes; }
+        finally { Marshal.FreeHGlobal(p); }
+    }
+    static IntPtr TabProcess(IntPtr tab) {
+        uint pid; GetWindowThreadProcessId(tab, out pid);
+        IntPtr p = OpenProcess(0x1038, false, pid);
+        if (p == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+        return p;
+    }
+    static void WriteRemote(IntPtr p, IntPtr address, byte[] data) {
+        UIntPtr written;
+        if (!WriteProcessMemory(p, address, data, (UIntPtr)data.Length, out written) || written.ToUInt64() != (ulong)data.Length)
+            throw new System.ComponentModel.Win32Exception();
+    }
+    static byte[] ReadRemote(IntPtr p, IntPtr address, int size) {
+        byte[] data = new byte[size]; UIntPtr read;
+        if (!ReadProcessMemory(p, address, data, (UIntPtr)size, out read) || read.ToUInt64() != (ulong)size)
+            throw new System.ComponentModel.Win32Exception();
+        return data;
+    }
+    public static string[] TabNames(IntPtr tab) {
+        int count = SendMessageValue(tab, 0x1304, IntPtr.Zero, IntPtr.Zero).ToInt32();
+        if (count < 1 || count > 32) throw new InvalidOperationException("Unexpected tab count: " + count);
+        IntPtr p = TabProcess(tab), remote = IntPtr.Zero;
+        try {
+            remote = VirtualAllocEx(p, IntPtr.Zero, (UIntPtr)1024, 0x3000, 0x04);
+            if (remote == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+            var names = new string[count];
+            for (int i = 0; i < count; i++) {
+                var item = new TabItem { mask = 1, text = IntPtr.Add(remote, 128), textMax = 256 };
+                WriteRemote(p, remote, BytesOf(item));
+                if (SendMessageValue(tab, 0x133c, (IntPtr)i, remote) == IntPtr.Zero)
+                    throw new InvalidOperationException("Cannot read tab " + i);
+                names[i] = Encoding.Unicode.GetString(ReadRemote(p, item.text, 512)).Split('\0')[0];
+            }
+            return names;
+        } finally { if (remote != IntPtr.Zero) VirtualFreeEx(p, remote, UIntPtr.Zero, 0x8000); CloseHandle(p); }
+    }
+    public static void ClickTab(IntPtr tab, int index) {
+        IntPtr p = TabProcess(tab), remote = IntPtr.Zero;
+        try {
+            remote = VirtualAllocEx(p, IntPtr.Zero, (UIntPtr)16, 0x3000, 0x04);
+            if (remote == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+            if (SendMessageValue(tab, 0x130a, (IntPtr)index, remote) == IntPtr.Zero)
+                throw new InvalidOperationException("Cannot read tab position");
+            byte[] rect = ReadRemote(p, remote, 16);
+            int x = (BitConverter.ToInt32(rect, 0) + BitConverter.ToInt32(rect, 8)) / 2;
+            int y = (BitConverter.ToInt32(rect, 4) + BitConverter.ToInt32(rect, 12)) / 2;
+            IntPtr point = (IntPtr)((y << 16) | (x & 0xffff));
+            if (!PostMessage(tab, 0x0201, (IntPtr)1, point) || !PostMessage(tab, 0x0202, IntPtr.Zero, point))
+                throw new System.ComponentModel.Win32Exception();
+        } finally { if (remote != IntPtr.Zero) VirtualFreeEx(p, remote, UIntPtr.Zero, 0x8000); CloseHandle(p); }
+    }
     public static IntPtr[] Windows(uint pid) {
         var list = new List<IntPtr>();
         EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == pid && IsWindowVisible(h)) list.Add(h); return true; }, IntPtr.Zero);
@@ -89,22 +158,11 @@ function Command([IntPtr]$Window, [int]$Id) {
     if (-not [GuiNative]::PostMessage($Window, 0x0111, [IntPtr]$Id, [IntPtr]::Zero)) { throw "Posting command $Id failed." }
 }
 function Select-AutoTab([IntPtr]$Editor) {
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Editor)
-    $condition = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::NameProperty, 'Auto match')
-    try {
-        $tab = Wait-For { $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition) } 'Auto match tab'
-    } catch {
-        $elements = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-        foreach ($element in $elements) {
-            Write-Host ("GUI element: type={0}, class={1}, id={2}, name={3}" -f `
-                $element.Current.ControlType.ProgrammaticName, $element.Current.ClassName, `
-                $element.Current.AutomationId, $element.Current.Name)
-        }
-        throw
-    }
-    $pattern = $tab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-    $pattern.Select()
+    $tab = Control $Editor 105
+    $names = [GuiNative]::TabNames($tab)
+    $index = [Array]::IndexOf($names, 'Auto match')
+    if ($index -lt 0) { throw "Auto match tab is absent. Tabs: $($names -join ', ')" }
+    [GuiNative]::ClickTab($tab, $index)
     $field = Control $Editor 337
     [void](Wait-For { if ([GuiNative]::IsWindowVisible($field)) { $true } } 'visible Auto match page')
 }
