@@ -154,7 +154,8 @@ VOID _app_db_parse_app (
 
 VOID _app_db_parse_rule (
 	_Inout_ PDB_INFORMATION db_info,
-	_In_ ENUM_TYPE_DATA type
+	_In_ ENUM_TYPE_DATA type,
+	_In_ BOOLEAN is_automatic
 );
 
 VOID _app_db_parse_ruleconfig (

@@ -3,6 +3,15 @@
 
 #include "global.h"
 
+static BOOLEAN _wfp_createrulefilters_internal (
+	_In_ HANDLE engine_handle,
+	_In_ PR_LIST rules,
+	_In_ LPCWSTR file_name,
+	_In_ ULONG line,
+	_In_ BOOLEAN is_intransact,
+	_Out_opt_ PBOOLEAN out_fatal
+);
+
 // there is russian documentation on how WFP works:
 // https://www.cyberforum.ru/drivers-programming/thread1298567.html
 HANDLE _wfp_getenginehandle ()
@@ -216,7 +225,7 @@ BOOLEAN _wfp_initialize (
 	BOOLEAN is_success = TRUE; // already initialized
 	ULONG status;
 
-	_r_queuedlock_acquireshared (&lock_transaction);
+	_r_queuedlock_acquireexclusive (&lock_transaction);
 
 	_app_setenginesecurity (engine_handle);
 
@@ -372,7 +381,7 @@ BOOLEAN _wfp_initialize (
 
 CleanupExit:
 
-	_r_queuedlock_releaseshared (&lock_transaction);
+	_r_queuedlock_releaseexclusive (&lock_transaction);
 
 	return is_success;
 }
@@ -389,7 +398,7 @@ VOID _wfp_uninitialize (
 	BOOLEAN is_intransact;
 	ULONG status;
 
-	_r_queuedlock_acquireshared (&lock_transaction);
+	_r_queuedlock_acquireexclusive (&lock_transaction);
 
 	// dropped packets logging (win7+)
 	if (config.is_neteventset)
@@ -471,7 +480,26 @@ VOID _wfp_uninitialize (
 			_r_obj_dereference (callouts);
 	}
 
-	_r_queuedlock_releaseshared (&lock_transaction);
+	_r_queuedlock_releaseexclusive (&lock_transaction);
+}
+
+// Pair each live GUID array with an owned copy. A transaction rollback restores
+// Windows state, so every corresponding application/rule/global array must follow.
+static VOID _wfp_snapshotfilterids (
+	_In_ PR_LIST targets,
+	_In_ PR_LIST copies,
+	_In_ PR_ARRAY target
+)
+{
+	PR_ARRAY copy;
+
+	copy = _r_obj_createarray (sizeof (GUID), 0x02, NULL);
+
+	if (!_r_obj_isempty2 (target))
+		_r_obj_addarrayitems (copy, target->items, target->count);
+
+	_r_obj_addlistitem (targets, _r_obj_reference (target), NULL);
+	_r_obj_addlistitem (copies, copy, NULL);
 }
 
 VOID _wfp_installfilters (
@@ -480,98 +508,160 @@ VOID _wfp_installfilters (
 {
 	PITEM_APP ptr_app = NULL;
 	PITEM_RULE ptr_rule;
-	PR_ARRAY guids;
-	PR_LIST rules;
+	PR_ARRAY guids = NULL, target, previous;
+	PR_LIST rules, saved_apps, saved_rules, targets, copies;
 	LPCGUID guid;
 	ULONG_PTR enum_key = 0;
-	BOOLEAN is_intransact;
+	BOOLEAN is_committed = FALSE, is_fatal = FALSE;
 	ULONG status;
 
-	// set security information
-	_app_setprovidersecurity (engine_handle, &GUID_WfpProvider, FALSE);
-	_app_setsublayersecurity (engine_handle, &GUID_WfpSublayer, FALSE);
-
-	_wfp_clearfilter_ids ();
-
-	_r_queuedlock_acquireshared (&lock_transaction);
-
-	status = _wfp_dumpfilters (engine_handle, &GUID_WfpProvider, &guids);
-
-	// restore filters security
-	if (status == ERROR_SUCCESS)
-	{
-		for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
-		{
-			guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
-
-			if (guid)
-				_app_setfiltersecurity (engine_handle, guid, FALSE, DBG_ARG);
-		}
-	}
-
-	is_intransact = _wfp_transact_start (engine_handle, DBG_ARG);
-
-	// destroy all filters
-	if (status == ERROR_SUCCESS)
-	{
-		for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
-		{
-			guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
-
-			if (guid)
-				_wfp_deletefilter (engine_handle, guid, DBG_ARG);
-		}
-
-		_r_obj_dereference (guids);
-	}
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
 
 	rules = _r_obj_createlist (0x10, &_r_obj_dereference);
+	saved_apps = _r_obj_createlist (0x10, &_r_obj_dereference);
+	saved_rules = _r_obj_createlist (0x10, &_r_obj_dereference);
+	targets = _r_obj_createlist (0x10, &_r_obj_dereference);
+	copies = _r_obj_createlist (0x10, &_r_obj_dereference);
 
-	// apply apps rules
-	_r_queuedlock_acquireshared (&lock_apps);
-
-	while (_r_obj_enumhashtablepointer (apps_table, (PVOID_PTR)&ptr_app, NULL, &enum_key))
-	{
-		if (!!ptr_app->is_enabled)
-			_r_obj_addlistitem (rules, _r_obj_reference (ptr_app), NULL);
-	}
-
-	_r_queuedlock_releaseshared (&lock_apps);
-
-	if (!_r_obj_isempty2 (rules))
-	{
-		_wfp_createappfilters (engine_handle, rules, DBG_ARG, is_intransact);
-
-		_r_obj_clearlist (rules);
-	}
-
-	// apply blocklist/system/user rules
 	_r_queuedlock_acquireshared (&lock_rules);
 
 	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules_list); i++)
 	{
 		ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules_list, i);
 
-		if (ptr_rule && !!ptr_rule->is_enabled)
-			_r_obj_addlistitem (rules, _r_obj_reference (ptr_rule), NULL);
+		if (ptr_rule)
+			_r_obj_addlistitem (saved_rules, _r_obj_reference (ptr_rule), NULL);
 	}
 
 	_r_queuedlock_releaseshared (&lock_rules);
 
+	// Signature/file IO precedes the transaction lock.
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (saved_rules); i++)
+		_app_rule_refresh_autoapps ((PITEM_RULE)_r_obj_getlistitem (saved_rules, i));
+
+	_app_setprovidersecurity (engine_handle, &GUID_WfpProvider, FALSE);
+	_app_setsublayersecurity (engine_handle, &GUID_WfpSublayer, FALSE);
+
+	_r_queuedlock_acquireexclusive (&lock_transaction);
+
+	// Copy IDs only after other filter writers have finished.
+	_wfp_snapshotfilterids (targets, copies, filter_ids);
+
+	_r_queuedlock_acquireshared (&lock_apps);
+
+	while (_r_obj_enumhashtablepointer (apps_table, (PVOID_PTR)&ptr_app, NULL, &enum_key))
+	{
+		_r_obj_addlistitem (saved_apps, _r_obj_reference (ptr_app), NULL);
+		_wfp_snapshotfilterids (targets, copies, ptr_app->guids);
+	}
+
+	_r_queuedlock_releaseshared (&lock_apps);
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (saved_rules); i++)
+	{
+		ptr_rule = (PITEM_RULE)_r_obj_getlistitem (saved_rules, i);
+		_wfp_snapshotfilterids (targets, copies, ptr_rule->guids);
+	}
+
+	status = _wfp_dumpfilters (engine_handle, &GUID_WfpProvider, &guids);
+
+	// ERROR_NOT_FOUND is the ordinary first-install case.
+	if (status != ERROR_SUCCESS && status != ERROR_NOT_FOUND)
+		goto CleanupInstall;
+
+	if (guids)
+	{
+		for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
+		{
+			guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
+			_app_setfiltersecurity (engine_handle, guid, FALSE, DBG_ARG);
+		}
+	}
+
+	if (!_wfp_transact_start (engine_handle, DBG_ARG))
+		goto CleanupInstall;
+
+	if (guids)
+	{
+		for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
+		{
+			guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
+
+			if (!_wfp_deletefilter (engine_handle, guid, DBG_ARG))
+				is_fatal = TRUE;
+		}
+	}
+
+	if (is_fatal)
+	{
+		FwpmTransactionAbort0 (engine_handle);
+		goto CleanupInstall;
+	}
+
+	_wfp_clearfilter_ids ();
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (saved_apps); i++)
+	{
+		ptr_app = (PITEM_APP)_r_obj_getlistitem (saved_apps, i);
+
+		if (ptr_app->is_enabled)
+			_r_obj_addlistitem (rules, _r_obj_reference (ptr_app), NULL);
+	}
+
 	if (!_r_obj_isempty2 (rules))
 	{
-		_wfp_createrulefilters (engine_handle, rules, DBG_ARG, is_intransact);
-
+		_wfp_createappfilters (engine_handle, rules, DBG_ARG, TRUE);
 		_r_obj_clearlist (rules);
 	}
 
-	// apply internal rules
-	_wfp_createglobalfilters (engine_handle, DBG_ARG, is_intransact);
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (saved_rules); i++)
+	{
+		ptr_rule = (PITEM_RULE)_r_obj_getlistitem (saved_rules, i);
 
-	if (is_intransact)
-		_wfp_transact_commit (engine_handle, DBG_ARG);
+		if (ptr_rule->is_enabled)
+			_r_obj_addlistitem (rules, _r_obj_reference (ptr_rule), NULL);
+	}
 
-	// secure filters
+	if (!_r_obj_isempty2 (rules))
+	{
+		// A malformed/missing rule member is recoverable: retain successful
+		// rules and the baseline blocks. Failed automatic grants are removed
+		// locally; only a failed cleanup makes the entire transaction unsafe.
+		_wfp_createrulefilters_internal (engine_handle, rules, DBG_ARG, TRUE, &is_fatal);
+		_r_obj_clearlist (rules);
+	}
+
+	_wfp_createglobalfilters (engine_handle, DBG_ARG, TRUE);
+
+	if (is_fatal)
+		FwpmTransactionAbort0 (engine_handle);
+	else
+		is_committed = _wfp_transact_commit (engine_handle, DBG_ARG);
+
+CleanupInstall:
+
+	if (guids)
+		_r_obj_dereference (guids);
+
+	if (!is_committed)
+	{
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (targets); i++)
+		{
+			target = (PR_ARRAY)_r_obj_getlistitem (targets, i);
+			previous = (PR_ARRAY)_r_obj_getlistitem (copies, i);
+			_r_obj_cleararray (target);
+
+			if (!_r_obj_isempty2 (previous))
+				_r_obj_addarrayitems (target, previous->items, previous->count);
+		}
+
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (saved_apps); i++)
+			((PITEM_APP)_r_obj_getlistitem (saved_apps, i))->is_haveerrors = TRUE;
+
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (saved_rules); i++)
+			((PITEM_RULE)_r_obj_getlistitem (saved_rules, i))->is_haveerrors = TRUE;
+	}
+
 	status = _wfp_dumpfilters (engine_handle, &GUID_WfpProvider, &guids);
 
 	if (status == ERROR_SUCCESS)
@@ -579,9 +669,7 @@ VOID _wfp_installfilters (
 		for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
 		{
 			guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
-
-			if (guid)
-				_app_setfiltersecurity (engine_handle, guid, TRUE, DBG_ARG);
+			_app_setfiltersecurity (engine_handle, guid, TRUE, DBG_ARG);
 		}
 
 		_r_obj_dereference (guids);
@@ -590,9 +678,14 @@ VOID _wfp_installfilters (
 	_app_setprovidersecurity (engine_handle, &GUID_WfpProvider, TRUE);
 	_app_setsublayersecurity (engine_handle, &GUID_WfpSublayer, TRUE);
 
-	_r_queuedlock_releaseshared (&lock_transaction);
+	_r_queuedlock_releaseexclusive (&lock_transaction);
 
+	_r_obj_dereference (copies);
+	_r_obj_dereference (targets);
+	_r_obj_dereference (saved_rules);
+	_r_obj_dereference (saved_apps);
 	_r_obj_dereference (rules);
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
 }
 
 BOOLEAN _wfp_transact_start (
@@ -855,22 +948,28 @@ VOID _wfp_destroyfilters (
 	PR_ARRAY guids;
 	ULONG status;
 
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
+
 	_wfp_clearfilter_ids ();
 
 	// destroy all filters
-	_r_queuedlock_acquireshared (&lock_transaction);
+	_r_queuedlock_acquireexclusive (&lock_transaction);
 	status = _wfp_dumpfilters (engine_handle, &GUID_WfpProvider, &guids);
-	_r_queuedlock_releaseshared (&lock_transaction);
+	_r_queuedlock_releaseexclusive (&lock_transaction);
 
 	if (status != ERROR_SUCCESS)
+	{
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
 		return;
+	}
 
 	_wfp_destroyfilters_array (engine_handle, guids, DBG_ARG);
 
 	_r_obj_dereference (guids);
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
 }
 
-VOID _wfp_destroyfilters_array (
+BOOLEAN _wfp_destroyfilters_array (
 	_In_ HANDLE engine_handle,
 	_Inout_ PR_ARRAY guids,
 	_In_ LPCWSTR file_name,
@@ -878,14 +977,13 @@ VOID _wfp_destroyfilters_array (
 )
 {
 	LPCGUID guid;
-	BOOLEAN is_enabled, is_intransact;
+	BOOLEAN is_enabled, is_success = FALSE;
 
 	if (_r_obj_isempty2 (guids))
-		return;
+		return TRUE;
 
-	is_enabled = _app_initinterfacestate (_r_app_gethwnd (), FALSE);
-
-	_r_queuedlock_acquireshared (&lock_transaction);
+	is_enabled = _r_queuedlock_islocked (&lock_apply) ? FALSE : _app_initinterfacestate (_r_app_gethwnd (), FALSE);
+	_r_queuedlock_acquireexclusive (&lock_transaction);
 
 	for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
 	{
@@ -895,24 +993,47 @@ VOID _wfp_destroyfilters_array (
 			_app_setfiltersecurity (engine_handle, guid, FALSE, DBG_ARG_VAR);
 	}
 
-	is_intransact = _wfp_transact_start (engine_handle, DBG_ARG_VAR);
+	if (!_wfp_transact_start (engine_handle, DBG_ARG_VAR))
+		goto CleanupDelete;
+
+	is_success = TRUE;
 
 	for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
 	{
 		guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
 
-		if (guid)
-			_wfp_deletefilter (engine_handle, guid, DBG_ARG_VAR);
+		if (guid && !_wfp_deletefilter (engine_handle, guid, DBG_ARG_VAR))
+			is_success = FALSE;
 	}
 
-	if (is_intransact)
-		_wfp_transact_commit (engine_handle, DBG_ARG_VAR);
+	if (is_success)
+		is_success = _wfp_transact_commit (engine_handle, DBG_ARG_VAR);
+	else
+		FwpmTransactionAbort0 (engine_handle);
 
-	_r_queuedlock_releaseshared (&lock_transaction);
+CleanupDelete:
 
+	if (is_success)
+	{
+		_r_obj_cleararray (guids);
+	}
+	else
+	{
+		// The old filters still exist after a failed/aborted transaction.
+		// Preserve their IDs so a later revoke can find every permit again.
+		for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
+		{
+			guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
+
+			if (guid)
+				_app_setfiltersecurity (engine_handle, guid, TRUE, DBG_ARG_VAR);
+		}
+	}
+
+	_r_queuedlock_releaseexclusive (&lock_transaction);
 	_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
 
-	_r_obj_cleararray (guids);
+	return is_success;
 }
 
 BOOLEAN _wfp_createrulefilter (
@@ -1184,27 +1305,43 @@ BOOLEAN _wfp_createrulefilter (
 		count += 1;
 	}
 
+	if ((direction != FWP_DIRECTION_OUTBOUND && direction != FWP_DIRECTION_INBOUND && direction != FWP_DIRECTION_MAX) ||
+		(af != AF_INET && af != AF_INET6 && af != AF_UNSPEC))
+		goto CleanupExit;
+
+	is_success = TRUE;
+
 	// create outbound layer filter
 	if (direction == FWP_DIRECTION_OUTBOUND || direction == FWP_DIRECTION_MAX)
 	{
 		if (af == AF_INET || af == AF_UNSPEC)
-			_wfp_createfilter (engine_handle, filter_type, filter_name, fwfc, count, &FWPM_LAYER_ALE_AUTH_CONNECT_V4, NULL, weight, action, flags, guids);
+		{
+			if (_wfp_createfilter (engine_handle, filter_type, filter_name, fwfc, count, &FWPM_LAYER_ALE_AUTH_CONNECT_V4, NULL, weight, action, flags, guids) != ERROR_SUCCESS)
+				is_success = FALSE;
+		}
 
 		if (af == AF_INET6 || af == AF_UNSPEC)
-			_wfp_createfilter (engine_handle, filter_type, filter_name, fwfc, count, &FWPM_LAYER_ALE_AUTH_CONNECT_V6, NULL, weight, action, flags, guids);
+		{
+			if (_wfp_createfilter (engine_handle, filter_type, filter_name, fwfc, count, &FWPM_LAYER_ALE_AUTH_CONNECT_V6, NULL, weight, action, flags, guids) != ERROR_SUCCESS)
+				is_success = FALSE;
+		}
 	}
 
 	// create inbound layer filter
 	if (direction == FWP_DIRECTION_INBOUND || direction == FWP_DIRECTION_MAX)
 	{
 		if (af == AF_INET || af == AF_UNSPEC)
-			_wfp_createfilter (engine_handle, filter_type, filter_name, fwfc, count, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, NULL, weight, action, flags, guids);
+		{
+			if (_wfp_createfilter (engine_handle, filter_type, filter_name, fwfc, count, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, NULL, weight, action, flags, guids) != ERROR_SUCCESS)
+				is_success = FALSE;
+		}
 
 		if (af == AF_INET6 || af == AF_UNSPEC)
-			_wfp_createfilter (engine_handle, filter_type, filter_name, fwfc, count, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, NULL, weight, action, flags, guids);
+		{
+			if (_wfp_createfilter (engine_handle, filter_type, filter_name, fwfc, count, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, NULL, weight, action, flags, guids) != ERROR_SUCCESS)
+				is_success = FALSE;
+		}
 	}
-
-	is_success = TRUE;
 
 CleanupExit:
 
@@ -1217,6 +1354,144 @@ CleanupExit:
 	return is_success;
 }
 
+// A default-block event can discover a new version/path. Matching and rule
+// updates share this lock with ordinary rebuilds, making repeated events idempotent.
+BOOLEAN _wfp_autoallow_app (
+	_In_opt_ HWND hwnd,
+	_In_ PITEM_APP ptr_app,
+	_In_ PITEM_LOG ptr_log
+)
+{
+	PITEM_RULE ptr_rule;
+	PR_LIST candidates, changed;
+	BOOLEAN is_match, is_member, is_success = TRUE, is_granted = FALSE;
+
+	if (_r_queuedlock_islocked (&lock_apply) || !_wfp_isfiltersinstalled () || ptr_app->type != DATA_APP_REGULAR || ptr_app->is_autoallow_blocked)
+		return FALSE;
+
+	candidates = _r_obj_createlist (0x10, &_r_obj_dereference);
+	changed = _r_obj_createlist (0x02, NULL);
+
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
+
+	if (_r_queuedlock_islocked (&lock_apply) || !_wfp_isfiltersinstalled () || ptr_app->is_autoallow_blocked)
+	{
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
+		_r_obj_dereference (changed);
+		_r_obj_dereference (candidates);
+		return FALSE;
+	}
+
+	_r_queuedlock_acquireshared (&lock_rules);
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules_list); i++)
+	{
+		ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules_list, i);
+
+		if (ptr_rule && _app_rule_hasauto (ptr_rule) && ptr_rule->is_enabled)
+			_r_obj_addlistitem (candidates, _r_obj_reference (ptr_rule), NULL);
+	}
+
+	_r_queuedlock_releaseshared (&lock_rules);
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (candidates); i++)
+	{
+		ptr_rule = (PITEM_RULE)_r_obj_getlistitem (candidates, i);
+		is_match = _app_rule_matchapp (ptr_rule, ptr_app);
+
+		_r_queuedlock_acquireexclusive (&lock_autoapps);
+		is_member = (_r_obj_findhashtable (ptr_rule->auto_apps, ptr_app->app_hash) != NULL);
+
+		if (is_match && !is_member)
+			_r_obj_addhashtableitem (ptr_rule->auto_apps, ptr_app->app_hash, NULL);
+		else if (!is_match && is_member)
+			_r_obj_removehashtableitem (ptr_rule->auto_apps, ptr_app->app_hash);
+
+		_r_queuedlock_releaseexclusive (&lock_autoapps);
+
+		if (is_match != is_member || (is_match && (ptr_rule->is_haveerrors || _r_obj_isempty2 (ptr_rule->guids))))
+			_r_obj_addlistitem (changed, ptr_rule, NULL);
+	}
+
+	if (!_r_obj_isempty2 (changed))
+		is_success = _wfp_createrulefilters_internal (_wfp_getenginehandle (), changed, DBG_ARG, FALSE, NULL);
+
+	if (is_success && !ptr_app->is_autoallow_blocked)
+	{
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (candidates); i++)
+		{
+			ptr_rule = (PITEM_RULE)_r_obj_getlistitem (candidates, i);
+
+			_r_queuedlock_acquireshared (&lock_autoapps);
+			is_member = (_r_obj_findhashtable (ptr_rule->auto_apps, ptr_app->app_hash) != NULL);
+			_r_queuedlock_releaseshared (&lock_autoapps);
+
+			// Address-constrained rules may not cover this blocked connection.
+			// Keep its notification unless coverage can be established directly.
+			if (is_member && ptr_rule->is_enabled && !ptr_rule->is_haveerrors && !_r_obj_isempty2 (ptr_rule->guids) &&
+				_r_obj_isstringempty (ptr_rule->rule_remote) && _r_obj_isstringempty (ptr_rule->rule_local) &&
+				(!ptr_rule->protocol || ptr_rule->protocol == ptr_log->protocol) &&
+				(ptr_rule->af == AF_UNSPEC || ptr_rule->af == ptr_log->af) &&
+				(ptr_rule->direction == FWP_DIRECTION_MAX || ptr_rule->direction == ptr_log->direction))
+			{
+				is_granted = TRUE;
+				break;
+			}
+		}
+	}
+
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+	if (hwnd && !_r_obj_isempty2 (changed))
+	{
+		_app_listview_updateitemby_param (hwnd, ptr_app->app_hash, TRUE);
+		_app_listview_updateby_id (hwnd, DATA_RULE_USER, PR_UPDATE_FORCE | PR_UPDATE_TYPE);
+	}
+
+	_r_obj_dereference (changed);
+	_r_obj_dereference (candidates);
+
+	return is_granted;
+}
+
+VOID _app_autoallow_refresh (
+	_In_opt_ HWND hwnd
+)
+{
+	PITEM_RULE ptr_rule;
+	PR_LIST rules;
+
+	rules = _r_obj_createlist (0x10, &_r_obj_dereference);
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
+	_r_queuedlock_acquireshared (&lock_rules);
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules_list); i++)
+	{
+		ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules_list, i);
+
+		if (ptr_rule && _app_rule_hasauto (ptr_rule))
+			_r_obj_addlistitem (rules, _r_obj_reference (ptr_rule), NULL);
+	}
+
+	_r_queuedlock_releaseshared (&lock_rules);
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
+		_app_rule_refresh_autoapps ((PITEM_RULE)_r_obj_getlistitem (rules, i));
+
+	if (!_r_obj_isempty2 (rules) && _wfp_isfiltersinstalled ())
+		_wfp_createrulefilters_internal (_wfp_getenginehandle (), rules, DBG_ARG, FALSE, NULL);
+
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+	if (hwnd && !_r_obj_isempty2 (rules))
+	{
+		_app_listview_updateby_id (hwnd, DATA_APP_REGULAR, PR_UPDATE_FORCE | PR_UPDATE_TYPE);
+		_app_listview_updateby_id (hwnd, DATA_RULE_USER, PR_UPDATE_FORCE | PR_UPDATE_TYPE);
+	}
+
+	_r_obj_dereference (rules);
+}
+
 BOOLEAN _wfp_createrulefilters (
 	_In_ HANDLE engine_handle,
 	_In_ PR_LIST rules,
@@ -1225,24 +1500,58 @@ BOOLEAN _wfp_createrulefilters (
 	_In_ BOOLEAN is_intransact
 )
 {
+	BOOLEAN is_success, is_enabled;
+
+	is_enabled = _app_initinterfacestate (_r_app_gethwnd (), FALSE);
+
+	// All callers outside full installation enter here before any transaction.
+	// Full installation already owns this lock and calls the internal function.
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
+	{
+		PITEM_RULE ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules, i);
+
+		if (ptr_rule)
+			_app_rule_refresh_autoapps (ptr_rule);
+	}
+
+	is_success = _wfp_createrulefilters_internal (engine_handle, rules, DBG_ARG_VAR, is_intransact, NULL);
+
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+	_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
+
+	return is_success;
+}
+
+static BOOLEAN _wfp_createrulefilters_internal (
+	_In_ HANDLE engine_handle,
+	_In_ PR_LIST rules,
+	_In_ LPCWSTR file_name,
+	_In_ ULONG line,
+	_In_ BOOLEAN is_intransact,
+	_Out_opt_ PBOOLEAN out_fatal
+)
+{
 	R_STRINGREF local_remaining_part, remote_remaining_part, rule_local_part, rule_remote_part;
 	PITEM_RULE ptr_rule;
 	LPCWSTR rule_name;
-	PR_ARRAY guids;
+	PR_ARRAY guids, old_ids;
+	PR_LIST previous_ids;
 	LPCGUID guid;
 	ULONG_PTR enum_key;
 	ULONG hash_code;
-	BOOLEAN is_enabled;
+	BOOLEAN is_success = TRUE, is_committed = TRUE, is_abort = FALSE;
+
+	if (out_fatal)
+		*out_fatal = FALSE;
 
 	if (_r_obj_isempty2 (rules))
 		return FALSE;
 
-	is_enabled = _app_initinterfacestate (_r_app_gethwnd (), FALSE);
-
-	if (!is_intransact && _wfp_isfiltersapplying ())
-		is_intransact = TRUE;
-
 	guids = _r_obj_createarray (sizeof (GUID), 0x10, NULL);
+	previous_ids = _r_obj_createlist (0x10, &_r_obj_dereference);
 
 	if (!is_intransact)
 	{
@@ -1250,14 +1559,16 @@ BOOLEAN _wfp_createrulefilters (
 		{
 			ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules, i);
 
+			old_ids = _r_obj_createarray (sizeof (GUID), 0x02, NULL);
+			_r_obj_addlistitem (previous_ids, old_ids, NULL);
+
 			if (!ptr_rule)
 				continue;
 
 			if (!_r_obj_isempty2 (ptr_rule->guids))
 			{
 				_r_obj_addarrayitems (guids, ptr_rule->guids->items, ptr_rule->guids->count);
-
-				_r_obj_cleararray (ptr_rule->guids);
+				_r_obj_addarrayitems (old_ids, ptr_rule->guids->items, ptr_rule->guids->count);
 			}
 		}
 
@@ -1272,9 +1583,29 @@ BOOLEAN _wfp_createrulefilters (
 			}
 		}
 
-		_r_queuedlock_acquireshared (&lock_transaction);
+		_r_queuedlock_acquireexclusive (&lock_transaction);
 
-		is_intransact = !_wfp_transact_start (engine_handle, DBG_ARG_VAR);
+		if (!_wfp_transact_start (engine_handle, DBG_ARG_VAR))
+		{
+			for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
+			{
+				ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules, i);
+
+				if (ptr_rule && _app_rule_hasauto (ptr_rule))
+					ptr_rule->is_haveerrors = TRUE;
+			}
+
+			for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
+			{
+				guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
+				_app_setfiltersecurity (engine_handle, guid, TRUE, DBG_ARG_VAR);
+			}
+
+			_r_queuedlock_releaseexclusive (&lock_transaction);
+			_r_obj_dereference (previous_ids);
+			_r_obj_dereference (guids);
+			return FALSE;
+		}
 	}
 
 	if (!_r_obj_isempty2 (guids))
@@ -1283,9 +1614,33 @@ BOOLEAN _wfp_createrulefilters (
 		{
 			guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
 
-			if (guid)
-				_wfp_deletefilter (engine_handle, guid, DBG_ARG_VAR);
+			if (guid && !_wfp_deletefilter (engine_handle, guid, DBG_ARG_VAR))
+				is_success = FALSE;
 		}
+	}
+
+	if (!is_success && !is_intransact)
+	{
+		FwpmTransactionAbort0 (engine_handle);
+
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
+		{
+			ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules, i);
+
+			if (ptr_rule)
+				ptr_rule->is_haveerrors = TRUE;
+		}
+
+		for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
+		{
+			guid = (LPCGUID)_r_obj_getarrayitem (guids, i);
+			_app_setfiltersecurity (engine_handle, guid, TRUE, DBG_ARG_VAR);
+		}
+
+		_r_queuedlock_releaseexclusive (&lock_transaction);
+		_r_obj_dereference (previous_ids);
+		_r_obj_dereference (guids);
+		return FALSE;
 	}
 
 	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
@@ -1301,6 +1656,13 @@ BOOLEAN _wfp_createrulefilters (
 
 		if (!ptr_rule->is_enabled)
 			continue;
+
+		if (_app_rule_hasauto (ptr_rule) && !_app_rule_autoisvalid (ptr_rule))
+		{
+			ptr_rule->is_haveerrors = TRUE;
+			is_success = FALSE;
+			continue;
+		}
 
 		rule_name = _r_obj_getstring (ptr_rule->name);
 
@@ -1340,20 +1702,32 @@ BOOLEAN _wfp_createrulefilters (
 					ptr_rule->is_haveerrors = TRUE;
 			}
 
-			if (!_r_obj_isempty (ptr_rule->apps))
+			enum_key = 0;
+
+			while (_r_obj_enumhashtable (ptr_rule->apps, NULL, &hash_code, &enum_key))
 			{
-				enum_key = 0;
+				if ((ptr_rule->is_fordriver || ptr_rule->is_forservice) && _app_issystemhash (hash_code))
+					continue;
 
-				while (_r_obj_enumhashtable (ptr_rule->apps, NULL, &hash_code, &enum_key))
-				{
-					if ((ptr_rule->is_fordriver || ptr_rule->is_forservice) && _app_issystemhash (hash_code))
-						continue;
-
-					if (!_wfp_createrulefilter (engine_handle, ptr_rule->type, rule_name, hash_code, &ptr_rule->config, &rule_remote_part, &rule_local_part, ptr_rule->weight, ptr_rule->action, 0, ptr_rule->guids))
-						ptr_rule->is_haveerrors = TRUE;
-				}
+				if (!_wfp_createrulefilter (engine_handle, ptr_rule->type, rule_name, hash_code, &ptr_rule->config, &rule_remote_part, &rule_local_part, ptr_rule->weight, ptr_rule->action, 0, ptr_rule->guids))
+					ptr_rule->is_haveerrors = TRUE;
 			}
-			else
+
+			enum_key = 0;
+			_r_queuedlock_acquireshared (&lock_autoapps);
+
+			while (_r_obj_enumhashtable (ptr_rule->auto_apps, NULL, &hash_code, &enum_key))
+			{
+				if (_r_obj_findhashtable (ptr_rule->apps, hash_code))
+					continue;
+
+				if (!_wfp_createrulefilter (engine_handle, ptr_rule->type, rule_name, hash_code, &ptr_rule->config, &rule_remote_part, &rule_local_part, ptr_rule->weight, ptr_rule->action, 0, ptr_rule->guids))
+					ptr_rule->is_haveerrors = TRUE;
+			}
+
+			_r_queuedlock_releaseshared (&lock_autoapps);
+
+			if (_app_rule_isglobal (ptr_rule))
 			{
 				if (!_wfp_createrulefilter (engine_handle, ptr_rule->type, rule_name, 0, &ptr_rule->config, &rule_remote_part, &rule_local_part, ptr_rule->weight, ptr_rule->action, 0, ptr_rule->guids))
 					ptr_rule->is_haveerrors = TRUE;
@@ -1368,15 +1742,53 @@ BOOLEAN _wfp_createrulefilters (
 			if (local_remaining_part.length != 0)
 				_r_str_splitatchar (&local_remaining_part, DIVIDER_RULE[0], &rule_local_part, &local_remaining_part);
 		}
+
+		if (ptr_rule->is_haveerrors)
+		{
+			is_success = FALSE;
+
+			if (_app_rule_hasauto (ptr_rule))
+			{
+				for (ULONG_PTR j = 0; j < _r_obj_getarraysize (ptr_rule->guids); j++)
+				{
+					guid = (LPCGUID)_r_obj_getarrayitem (ptr_rule->guids, j);
+					if (!_wfp_deletefilter (engine_handle, guid, DBG_ARG_VAR))
+						is_abort = TRUE;
+				}
+
+				_r_obj_cleararray (ptr_rule->guids);
+			}
+		}
 	}
 
 	if (!is_intransact)
 	{
-		_wfp_transact_commit (engine_handle, DBG_ARG_VAR);
+		if (is_abort)
+		{
+			FwpmTransactionAbort0 (engine_handle);
+			is_committed = FALSE;
+		}
+		else
+		{
+			is_committed = _wfp_transact_commit (engine_handle, DBG_ARG_VAR);
+		}
+		is_success = is_success && is_committed;
 
 		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
 		{
 			ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules, i);
+
+			if (ptr_rule && !is_committed)
+			{
+				// A failed commit restored the preceding transaction state.
+				old_ids = (PR_ARRAY)_r_obj_getlistitem (previous_ids, i);
+				_r_obj_cleararray (ptr_rule->guids);
+
+				if (old_ids && !_r_obj_isempty2 (old_ids))
+					_r_obj_addarrayitems (ptr_rule->guids, old_ids->items, old_ids->count);
+
+				ptr_rule->is_haveerrors = TRUE;
+			}
 
 			if (ptr_rule && !!ptr_rule->is_enabled)
 			{
@@ -1390,14 +1802,16 @@ BOOLEAN _wfp_createrulefilters (
 			}
 		}
 
-		_r_queuedlock_releaseshared (&lock_transaction);
+		_r_queuedlock_releaseexclusive (&lock_transaction);
 	}
 
-	_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
-
+	_r_obj_dereference (previous_ids);
 	_r_obj_dereference (guids);
 
-	return TRUE;
+	if (out_fatal)
+		*out_fatal = is_abort;
+
+	return is_success && !is_abort;
 }
 
 BOOLEAN _wfp_createappfilters (
@@ -1417,12 +1831,9 @@ BOOLEAN _wfp_createappfilters (
 	if (_r_obj_isempty2 (rules))
 		return FALSE;
 
-	if (!is_intransact && _wfp_isfiltersapplying ())
-		is_intransact = TRUE;
-
 	guids = _r_obj_createarray (sizeof (GUID), 0x10, NULL);
 
-	is_enabled = _app_initinterfacestate (_r_app_gethwnd (), FALSE);
+	is_enabled = is_intransact ? FALSE : _app_initinterfacestate (_r_app_gethwnd (), FALSE);
 
 	if (!is_intransact)
 	{
@@ -1446,9 +1857,15 @@ BOOLEAN _wfp_createappfilters (
 				_app_setfiltersecurity (engine_handle, guid, FALSE, DBG_ARG_VAR);
 		}
 
-		_r_queuedlock_acquireshared (&lock_transaction);
+		_r_queuedlock_acquireexclusive (&lock_transaction);
 
-		is_intransact = !_wfp_transact_start (engine_handle, DBG_ARG_VAR);
+		if (!_wfp_transact_start (engine_handle, DBG_ARG_VAR))
+		{
+			_r_queuedlock_releaseexclusive (&lock_transaction);
+			_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
+			_r_obj_dereference (guids);
+			return FALSE;
+		}
 	}
 
 	for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
@@ -1495,7 +1912,7 @@ BOOLEAN _wfp_createappfilters (
 			}
 		}
 
-		_r_queuedlock_releaseshared (&lock_transaction);
+		_r_queuedlock_releaseexclusive (&lock_transaction);
 	}
 
 	_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
@@ -1552,10 +1969,7 @@ BOOLEAN _wfp_createglobalfilters (
 	FWP_ACTION_TYPE action;
 	BOOLEAN is_enabled;
 
-	is_enabled = _app_initinterfacestate (_r_app_gethwnd (), FALSE);
-
-	if (!is_intransact && _wfp_isfiltersapplying ())
-		is_intransact = TRUE;
+	is_enabled = is_intransact ? FALSE : _app_initinterfacestate (_r_app_gethwnd (), FALSE);
 
 	if (!is_intransact)
 	{
@@ -1570,9 +1984,14 @@ BOOLEAN _wfp_createglobalfilters (
 			}
 		}
 
-		_r_queuedlock_acquireshared (&lock_transaction);
+		_r_queuedlock_acquireexclusive (&lock_transaction);
 
-		is_intransact = !_wfp_transact_start (engine_handle, DBG_ARG_VAR);
+		if (!_wfp_transact_start (engine_handle, DBG_ARG_VAR))
+		{
+			_r_queuedlock_releaseexclusive (&lock_transaction);
+			_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
+			return FALSE;
+		}
 	}
 
 	if (!_r_obj_isempty (filter_ids))
@@ -1847,7 +2266,7 @@ BOOLEAN _wfp_createglobalfilters (
 				_app_setfiltersecurity (engine_handle, guid, TRUE, DBG_ARG_VAR);
 		}
 
-		_r_queuedlock_releaseshared (&lock_transaction);
+		_r_queuedlock_releaseexclusive (&lock_transaction);
 	}
 
 	_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);

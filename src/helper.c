@@ -138,6 +138,18 @@ VOID NTAPI _app_dereferencerule (
 	if (ptr_item->apps)
 		_r_obj_dereference (ptr_item->apps);
 
+	if (ptr_item->auto_apps)
+		_r_obj_dereference (ptr_item->auto_apps);
+
+	if (ptr_item->auto_filename)
+		_r_obj_dereference (ptr_item->auto_filename);
+
+	if (ptr_item->auto_directory)
+		_r_obj_dereference (ptr_item->auto_directory);
+
+	if (ptr_item->auto_publisher)
+		_r_obj_dereference (ptr_item->auto_publisher);
+
 	if (ptr_item->name)
 		_r_obj_dereference (ptr_item->name);
 }
@@ -1176,8 +1188,13 @@ BOOLEAN _app_setruletoapp (
 	if ((ptr_rule->is_fordriver || ptr_rule->is_forservice) && _app_issystemhash (ptr_app->app_hash))
 		return FALSE;
 
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
+
 	if (is_enable == (_r_obj_findhashtable (ptr_rule->apps, ptr_app->app_hash) != NULL))
+	{
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
 		return FALSE;
+	}
 
 	if (is_enable)
 	{
@@ -1189,9 +1206,11 @@ BOOLEAN _app_setruletoapp (
 	{
 		_r_obj_removehashtableitem (ptr_rule->apps, ptr_app->app_hash);
 
-		if (_r_obj_isempty (ptr_rule->apps))
+		if (_app_rule_isglobal (ptr_rule))
 			_app_ruleenable (ptr_rule, FALSE, TRUE);
 	}
+
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
 
 	if (item_id != INT_ERROR)
 	{
@@ -1615,24 +1634,57 @@ VOID _app_fileloggingenable ()
 	}
 }
 
+// The monitor can be forcibly stopped by its existing settings path. Keep new
+// matching/transaction locks on a workqueue worker that is not terminated there.
+static VOID NTAPI _app_monitorchanged (
+	_In_ PVOID context
+)
+{
+	PITEM_APP ptr_app = (PITEM_APP)context;
+	HWND hwnd;
+
+	hwnd = _r_app_gethwnd ();
+
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
+	ptr_app->is_autoallow_blocked = TRUE;
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+	_app_setappinfo (ptr_app, INFO_DISABLE, NULL);
+	_app_autoallow_refresh (hwnd);
+	_app_profile_save (hwnd);
+
+	_r_obj_dereference (ptr_app);
+}
+
 VOID NTAPI _app_timercallback (
 	_In_opt_ PVOID context
 )
 {
 	PITEM_APP ptr_app = NULL;
 	PR_STRING string;
+	PR_LIST applications;
 	ULONG_PTR enum_key;
 	NTSTATUS status;
 
 	while (TRUE)
 	{
+		applications = _r_obj_createlist (0x10, &_r_obj_dereference);
 		_r_queuedlock_acquireshared (&lock_apps);
-
 		enum_key = 0;
 
 		while (_r_obj_enumhashtablepointer (apps_table, (PVOID_PTR)&ptr_app, NULL, &enum_key))
 		{
-			if (!ptr_app->hash || !_app_isappvalidbinary (ptr_app->real_path) || !_app_isappused (ptr_app))
+			if (ptr_app->hash && ptr_app->real_path)
+				_r_obj_addlistitem (applications, _r_obj_reference (ptr_app), NULL);
+		}
+
+		_r_queuedlock_releaseshared (&lock_apps);
+
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (applications); i++)
+		{
+			ptr_app = (PITEM_APP)_r_obj_getlistitem (applications, i);
+
+			if (!_app_isappvalidbinary (ptr_app->real_path) || !_app_isappused (ptr_app))
 				continue;
 
 			status = _r_crypt_getfilehash (&string, BCRYPT_SHA256_ALGORITHM, &ptr_app->real_path->sr, NULL);
@@ -1642,8 +1694,7 @@ VOID NTAPI _app_timercallback (
 				if (!_r_str_isequal (&ptr_app->hash->sr, &string->sr, TRUE))
 				{
 					_r_obj_movereference ((PVOID_PTR)&ptr_app->hash, string);
-
-					_app_setappinfo (ptr_app, INFO_DISABLE, NULL);
+					_r_workqueue_queueitem (&file_queue, &_app_monitorchanged, _r_obj_reference (ptr_app));
 				}
 				else
 				{
@@ -1652,8 +1703,7 @@ VOID NTAPI _app_timercallback (
 			}
 		}
 
-		_r_queuedlock_releaseshared (&lock_apps);
-
+		_r_obj_dereference (applications);
 		_r_sys_waitforsingleobject (NtCurrentThread (), _r_calc_minutes2milliseconds (10));
 	}
 }

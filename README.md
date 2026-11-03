@@ -30,6 +30,7 @@ over Windows Filtering Platform (WFP) which is a set of internal API and system 
 applications. Windows Filtering Platform is a development technology and not a firewall itself, but simplewall is the tool that uses this technology.
 
 ### Features:
+- [Automatic application allow rules](docs/automatic-app-rules.md): exact executable name, optional installation directory and verified publisher (development branch; see build status)
 - Simple interface without annoying pop ups
 - [Rules editor](https://github.com/henrypp/simplewall#rules-editor) (create your own rules)
 - [Internal blocklist](https://crazymax.dev/WindowsSpyBlocker/blocking-rules/simplewall/) (block Windows spy / telemetry)

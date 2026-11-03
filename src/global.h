@@ -28,6 +28,7 @@
 #include "app.h"
 #include "rapp.h"
 #include "main.h"
+#include "autoallow_match.h"
 
 #include "resource.h"
 
@@ -54,6 +55,9 @@ DECLSPEC_SELECTANY R_QUEUED_LOCK lock_loglist = PR_QUEUED_LOCK_INIT;
 DECLSPEC_SELECTANY R_QUEUED_LOCK lock_notify = PR_QUEUED_LOCK_INIT;
 DECLSPEC_SELECTANY R_QUEUED_LOCK lock_profile = PR_QUEUED_LOCK_INIT;
 DECLSPEC_SELECTANY R_QUEUED_LOCK lock_transaction = PR_QUEUED_LOCK_INIT;
+// Matching may perform file/signature IO; never hold lock_apps or a WFP transaction.
+DECLSPEC_SELECTANY R_QUEUED_LOCK lock_autoallow = PR_QUEUED_LOCK_INIT;
+DECLSPEC_SELECTANY R_QUEUED_LOCK lock_autoapps = PR_QUEUED_LOCK_INIT;
 
 DECLSPEC_SELECTANY R_QUEUED_LOCK lock_cache_information = PR_QUEUED_LOCK_INIT;
 DECLSPEC_SELECTANY R_QUEUED_LOCK lock_cache_resolution = PR_QUEUED_LOCK_INIT;
