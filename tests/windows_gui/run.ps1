@@ -258,9 +258,23 @@ WF_State=false
         Write-Host ("Main window: exists={0}, responsive={1}" -f [GuiNative]::IsWindow($main), [GuiNative]::Responsive($main))
         foreach ($h in [GuiNative]::Windows([uint32]$proc.Id)) {
             $title = if ([GuiNative]::Responsive($h)) { [GuiNative]::Text($h) } else { '<unresponsive>' }
-            Write-Host ("Visible window on exit: class={0}, title={1}" -f [GuiNative]::ClassName($h), $title)
+            Write-Host ("Visible window on exit: class={0}, title={1}, main-control={2}" -f [GuiNative]::ClassName($h), $title, [GuiNative]::Child($h, 111))
+            if ([GuiNative]::Responsive($h)) {
+                $root = [System.Windows.Automation.AutomationElement]::FromHandle($h)
+                $elements = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+                foreach ($element in $elements) {
+                    if ($element.Current.Name) { Write-Host ("Visible element: {0}" -f $element.Current.Name) }
+                }
+            }
         }
         Write-Host ("Synthetic profile exists: {0}" -f (Test-Path -LiteralPath $profile -PathType Leaf))
+        if (Test-Path -LiteralPath $profile -PathType Leaf) {
+            [xml]$snapshot = Get-Content -LiteralPath $profile -Raw
+            $saved = @($snapshot.SelectNodes('/root/rules_auto/item') | Where-Object {
+                $_.GetAttribute('name') -in @('ci-gui-with-publisher', 'ci-gui-name-only')
+            })
+            Write-Host ("Synthetic automatic rules saved: {0}" -f $saved.Count)
+        }
         throw 'Application did not exit cleanly.'
     }
     if ($proc.ExitCode -ne 0) { throw "Application exit code: $($proc.ExitCode)." }
