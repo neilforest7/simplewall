@@ -98,6 +98,7 @@ jobs:
           pwsh -NoProfile -File tests\windows_integration\run.ps1 -SimplewallExe bin\64\simplewall.exe
           if errorlevel 1 exit /b 1
       - name: Verify the rule editor
+        if: ${{ !cancelled() && steps.built.outcome == 'success' }}
         shell: cmd
         run: |
           if not defined VS_DIR exit /b 1

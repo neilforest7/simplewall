@@ -96,15 +96,15 @@ cleanup:
 
 int wmain(int argc, wchar_t **argv)
 {
-    HANDLE engine = NULL, enumeration = NULL, callout_enumeration = NULL;
+    HANDLE engine = NULL, enumeration = NULL, callout_enumeration = NULL, layer_enumeration = NULL;
     FWPM_PROVIDER0 *provider = NULL;
     FWPM_SUBLAYER0 *sublayer = NULL;
     FWPM_FILTER_ENUM_TEMPLATE0 query = {0};
     FWPM_FILTER0 **filters = NULL;
-    FWPM_CALLOUT_ENUM_TEMPLATE0 callout_query = {0};
     FWPM_CALLOUT0 **callouts = NULL;
+    FWPM_LAYER0 **layers = NULL;
     FWP_BYTE_BLOB *expected = NULL;
-    UINT32 count = 0, total = 0, matched = 0, callout_count = 0;
+    UINT32 count = 0, layer_count = 0, total = 0, matched = 0, callout_count = 0;
     DWORD status = ERROR_SUCCESS;
     int result = 1, bad = 0, empty, transaction = 0;
     wchar_t description[256];
@@ -139,52 +139,68 @@ int wmain(int argc, wchar_t **argv)
     if (provider && (provider->flags & FWPM_PROVIDER_FLAG_PERSISTENT)) bad = 1;
     if (sublayer && (sublayer->flags & FWPM_SUBLAYER_FLAG_PERSISTENT)) bad = 1;
 
-    callout_query.providerKey = (GUID *)&provider_key;
-    status = FwpmCalloutCreateEnumHandle0(engine, &callout_query, &callout_enumeration);
+    /* A NULL template spans all layers; filter the results by provider below. */
+    status = FwpmCalloutCreateEnumHandle0(engine, NULL, &callout_enumeration);
     if (status != ERROR_SUCCESS) goto error;
     do {
         status = FwpmCalloutEnum0(engine, callout_enumeration, 128, &callouts, &count);
         if (status != ERROR_SUCCESS) goto error;
-        callout_count += count;
+        for (UINT32 i = 0; i < count; ++i) {
+            if (callouts[i]->providerKey && IsEqualGUID(callouts[i]->providerKey, &provider_key))
+                ++callout_count;
+        }
         if (callouts) FwpmFreeMemory0((void **)&callouts);
     } while (count);
 
     query.providerKey = (GUID *)&provider_key;
     query.actionMask = 0xffffffffu;
     query.flags = FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME | FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED;
-    status = FwpmFilterCreateEnumHandle0(engine, &query, &enumeration);
+    status = FwpmLayerCreateEnumHandle0(engine, NULL, &layer_enumeration);
     if (status != ERROR_SUCCESS) goto error;
     do {
-        status = FwpmFilterEnum0(engine, enumeration, 128, &filters, &count);
+        status = FwpmLayerEnum0(engine, layer_enumeration, 128, &layers, &layer_count);
         if (status != ERROR_SUCCESS) goto error;
-        for (UINT32 i = 0; i < count; ++i) {
-            FWPM_FILTER0 *f = filters[i];
-            const wchar_t *name = f->displayData.description ? f->displayData.description : L"";
-            ++total;
-            wprintf(L"filter id=%llu flags=0x%08lx action=0x%08lx conditions=%lu %ls\n",
-                (unsigned long long)f->filterId, f->flags, f->action.type,
-                f->numFilterConditions, name);
-            if (f->flags & (FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_BOOTTIME)) bad = 1;
-            if (f->action.type != FWP_ACTION_PERMIT) bad = 1;
-            if (!empty && wcscmp(name, description) == 0) {
-                unsigned appids = 0;
-                ++matched;
-                for (UINT32 j = 0; j < f->numFilterConditions; ++j) {
-                    FWPM_FILTER_CONDITION0 *c = &f->filterCondition[j];
-                    if (!IsEqualGUID(&c->fieldKey, &FWPM_CONDITION_ALE_APP_ID)) continue;
-                    ++appids;
-                    if (!expected || c->matchType != FWP_MATCH_EQUAL ||
-                        c->conditionValue.type != FWP_BYTE_BLOB_TYPE ||
-                        !c->conditionValue.byteBlob ||
-                        c->conditionValue.byteBlob->size != expected->size ||
-                        memcmp(c->conditionValue.byteBlob->data, expected->data, expected->size) != 0)
-                        bad = 1;
+        for (UINT32 layer = 0; layer < layer_count; ++layer) {
+            query.layerKey = layers[layer]->layerKey;
+            status = FwpmFilterCreateEnumHandle0(engine, &query, &enumeration);
+            if (status != ERROR_SUCCESS) goto error;
+            do {
+                status = FwpmFilterEnum0(engine, enumeration, 128, &filters, &count);
+                if (status != ERROR_SUCCESS) goto error;
+                for (UINT32 i = 0; i < count; ++i) {
+                    FWPM_FILTER0 *f = filters[i];
+                    const wchar_t *name = f->displayData.description ? f->displayData.description : L"";
+                    ++total;
+                    wprintf(L"filter id=%llu flags=0x%08lx action=0x%08lx conditions=%lu %ls\n",
+                        (unsigned long long)f->filterId, f->flags, f->action.type,
+                        f->numFilterConditions, name);
+                    if (f->flags & (FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_BOOTTIME)) bad = 1;
+                    if (f->action.type != FWP_ACTION_PERMIT) bad = 1;
+                    if (!empty && wcscmp(name, description) == 0) {
+                        unsigned appids = 0;
+                        ++matched;
+                        for (UINT32 j = 0; j < f->numFilterConditions; ++j) {
+                            FWPM_FILTER_CONDITION0 *c = &f->filterCondition[j];
+                            if (!IsEqualGUID(&c->fieldKey, &FWPM_CONDITION_ALE_APP_ID)) continue;
+                            ++appids;
+                            if (!expected || c->matchType != FWP_MATCH_EQUAL ||
+                                c->conditionValue.type != FWP_BYTE_BLOB_TYPE ||
+                                !c->conditionValue.byteBlob ||
+                                c->conditionValue.byteBlob->size != expected->size ||
+                                memcmp(c->conditionValue.byteBlob->data, expected->data, expected->size) != 0)
+                                bad = 1;
+                        }
+                        if (appids != 1 || f->action.type != FWP_ACTION_PERMIT) bad = 1;
+                    }
                 }
-                if (appids != 1 || f->action.type != FWP_ACTION_PERMIT) bad = 1;
-            }
+                if (filters) FwpmFreeMemory0((void **)&filters);
+            } while (count);
+            status = FwpmFilterDestroyEnumHandle0(engine, enumeration);
+            if (status != ERROR_SUCCESS) goto error;
+            enumeration = NULL;
         }
-        if (filters) FwpmFreeMemory0((void **)&filters);
-    } while (count);
+        if (layers) FwpmFreeMemory0((void **)&layers);
+    } while (layer_count);
     wprintf(L"filter_count=%lu callout_count=%lu rule_count=%lu safety_error=%d\n", total, callout_count, matched, bad);
     if (empty) result = (provider || sublayer || total || callout_count) ? 2 : 0;
     else result = (!provider || !sublayer || !total || callout_count || bad || (expected ? matched == 0 : matched != 0)) ? 2 : 0;
@@ -198,7 +214,9 @@ error:
 cleanup:
     if (filters) FwpmFreeMemory0((void **)&filters);
     if (callouts) FwpmFreeMemory0((void **)&callouts);
+    if (layers) FwpmFreeMemory0((void **)&layers);
     if (enumeration) FwpmFilterDestroyEnumHandle0(engine, enumeration);
+    if (layer_enumeration) FwpmLayerDestroyEnumHandle0(engine, layer_enumeration);
     if (callout_enumeration) FwpmCalloutDestroyEnumHandle0(engine, callout_enumeration);
     if (transaction) FwpmTransactionAbort0(engine);
     if (provider) FwpmFreeMemory0((void **)&provider);
