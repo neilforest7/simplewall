@@ -16,10 +16,10 @@ and uses the public `routine` SDK at commit
 The upstream automatic updater is disabled for this fork.
 
 The GitHub Actions workflow builds the complete x64 Windows application and
-runs matcher, rule-scope and WFP integration checks. Consult the workflow run
+runs matcher, rule-editor, rule-scope and WFP integration checks. Consult the workflow run
 for the result and retain a profile backup before switching versions.
 The Windows integration checks use a synthetic profile and an isolated runner;
-GUI editing and every configuration format are not covered.
+not every configuration format is covered.
 
 ## Create a rule
 
@@ -127,11 +127,14 @@ when saving a profile. Keep a backup before switching application versions.
 On Linux or another environment with Python 3 and a C11 compiler:
 
 ```sh
+export CC=clang
 python3 tests/autoallow_scope_test.py
 python3 tests/autoallow_xml_presence_test.py
 python3 tests/autoallow_revoke_test.py
 python3 tests/autoallow_warning_test.py
 python3 tests/autoallow_main_test.py
+python3 tests/profile_environment_test.py
+python3 tests/autoallow_messages_security_test.py
 ```
 
 These compile selected production functions with small API stubs. They cover
@@ -158,5 +161,6 @@ necessary link-creation capability. A failed trust fixture is a test failure,
 not a skipped positive verification.
 
 The Windows integration test exercises filter installation, profile reload and
-scoped loopback traffic on a disposable runner. The GUI, first blocked
-connections and manual exclusions require separate verification.
+scoped loopback traffic on a disposable runner. A separate GUI check exercises
+rule editing and saving. First blocked connections and manual exclusions still
+require full firewall verification.

@@ -30,6 +30,7 @@ public static class GuiNative {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, string s);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, StringBuilder s);
     [DllImport("user32.dll", EntryPoint="SendMessageW")] static extern IntPtr SendMessageValue(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", SetLastError=true)] static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
     [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
@@ -112,6 +113,7 @@ public static class GuiNative {
         return list.ToArray();
     }
     public static string ClassName(IntPtr h) { var b = new StringBuilder(256); GetClassName(h, b, b.Capacity); return b.ToString(); }
+    public static bool Responsive(IntPtr h) { UIntPtr result; return SendMessageTimeout(h, 0, IntPtr.Zero, IntPtr.Zero, 0x0002, 2000, out result) != IntPtr.Zero; }
     public static IntPtr Child(IntPtr parent, int id) {
         IntPtr result = IntPtr.Zero;
         EnumChildWindows(parent, (h, l) => { if (GetDlgCtrlID(h) == id) { result = h; return false; } return true; }, IntPtr.Zero);
@@ -252,7 +254,15 @@ WF_State=false
     Save-Editor $editor
     Assert-EmptyWfp
     Command $main 255
-    if (-not $proc.WaitForExit(20000)) { throw 'Application did not exit cleanly.' }
+    if (-not $proc.WaitForExit(20000)) {
+        Write-Host ("Main window: exists={0}, responsive={1}" -f [GuiNative]::IsWindow($main), [GuiNative]::Responsive($main))
+        foreach ($h in [GuiNative]::Windows([uint32]$proc.Id)) {
+            $title = if ([GuiNative]::Responsive($h)) { [GuiNative]::Text($h) } else { '<unresponsive>' }
+            Write-Host ("Visible window on exit: class={0}, title={1}" -f [GuiNative]::ClassName($h), $title)
+        }
+        Write-Host ("Synthetic profile exists: {0}" -f (Test-Path -LiteralPath $profile -PathType Leaf))
+        throw 'Application did not exit cleanly.'
+    }
     if ($proc.ExitCode -ne 0) { throw "Application exit code: $($proc.ExitCode)." }
     if (-not (Test-Path -LiteralPath $profile -PathType Leaf)) { throw 'Portable profile.xml was not written.' }
     [xml]$xml = Get-Content -LiteralPath $profile -Raw

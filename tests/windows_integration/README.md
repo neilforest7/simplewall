@@ -78,5 +78,4 @@ and the behavior of an abruptly terminated runner are not covered. The dynamic
 block is removed by BFE when the helper session closes, including helper death;
 the script additionally checks its specific filter key before app uninstall.
 
-The WFP assertions passed on a GitHub-hosted Windows VM in run 41706975514;
-that run's dialog-based cleanup failed. Silent cleanup requires a new CI run.
+Consult the corresponding GitHub Actions run for the tested revision and result.

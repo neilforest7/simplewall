@@ -31,6 +31,6 @@ If a failure leaves the GUI running, cleanup terminates that process and checks
 the inventory again; it never invokes the uninstall or install commands. Forced
 job termination can bypass cleanup, so discard the VM after the job.
 
-The test has not been validated by a GitHub-hosted run merely because its script
-parses successfully. A headless runner may have an input desktop but still be
-unable to expose the required GUI through UI Automation; that case fails.
+A syntax check alone does not validate this test. Consult the corresponding
+GitHub Actions run for the tested revision and result; an unavailable desktop
+or inaccessible required dialog causes the test to fail.

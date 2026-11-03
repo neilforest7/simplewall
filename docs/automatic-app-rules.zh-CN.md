@@ -11,9 +11,9 @@
 `2f7ce6a228dbbaa7295b9635ab971d2768a0ae9b`。其功能与上游 3.9.1 有差异，
 上游自动更新已关闭。
 
-GitHub Actions 工作流构建完整 Windows x64 程序，并执行匹配器、规则范围与
-WFP 集成检查；结果以对应工作流运行记录为准。切换版本前请备份配置。
-集成检查使用合成配置和隔离的测试环境，尚不覆盖图形编辑器及所有配置格式。
+GitHub Actions 工作流构建完整 Windows x64 程序，并执行匹配器、图形规则编辑器、
+规则范围和 WFP 集成检查；结果以对应工作流运行记录为准。切换版本前请备份配置。
+检查使用合成配置和隔离的测试环境，尚不覆盖所有配置格式。
 
 ## 如何使用
 
@@ -57,11 +57,14 @@ WFP 集成检查；结果以对应工作流运行记录为准。切换版本前�
 便携回归测试：
 
 ```sh
+export CC=clang
 python3 tests/autoallow_scope_test.py
 python3 tests/autoallow_xml_presence_test.py
 python3 tests/autoallow_revoke_test.py
 python3 tests/autoallow_warning_test.py
 python3 tests/autoallow_main_test.py
+python3 tests/profile_environment_test.py
+python3 tests/autoallow_messages_security_test.py
 ```
 
 撤销测试会对实际删除函数注入事务开始失败、过滤器删除失败和事务提交失败，检查失败时仍保留过滤器标识并恢复保护状态。
@@ -75,4 +78,5 @@ autoallow_match_test.exe "C:\Program Files\PowerShell\7\pwsh.exe"
 
 测试参数必须指向可信且具有嵌入式签名的可执行文件。测试会在线预热该签名的验证缓存，再调用实际的缓存验证逻辑；它也检查无签名、签名不符、文件被修改和目录边界等情况。无法创建符号链接时，该项明确报告跳过。
 
-Windows 集成测试覆盖过滤器安装、配置重载及受限的本地连接。图形界面、首次阻止后的发现和手动排除仍需单独验证。
+Windows 集成测试覆盖过滤器安装、配置重载及受限的本地连接；图形测试检查规则编辑和保存。
+首次阻止后的发现和手动排除仍需单独进行完整防火墙验证。
