@@ -149,7 +149,7 @@ function Write-Profile([string]$State) {
 }
 function Install-Profile {
     $script:started = $true
-    $process = Start-Process -FilePath $app -WorkingDirectory $appDir -PassThru `
+    $process = Start-Process -FilePath $app -WorkingDirectory $appDir -WindowStyle Hidden -PassThru `
         -ArgumentList '-install', '-temp', '-silent', '-portable'
     if (-not $process.WaitForExit(30000)) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
@@ -274,7 +274,14 @@ WF_State=false
         }
     }
     $env:SIMPLEWALL_INTEGRATION_ROOT = $priorRoot
-    if (-not $cleanupFailed) { Remove-Item -LiteralPath $runDir -Recurse -Force -ErrorAction Continue }
+    if (-not $cleanupFailed) {
+        $tempRoot = (Resolve-Path -LiteralPath $env:RUNNER_TEMP).ProviderPath.TrimEnd('\') + '\'
+        $resolvedRunDir = (Resolve-Path -LiteralPath $runDir).ProviderPath
+        if (-not $resolvedRunDir.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Refusing to remove a test directory outside RUNNER_TEMP.'
+        }
+        Remove-Item -LiteralPath $resolvedRunDir -Recurse -Force -ErrorAction Continue
+    }
     else { Write-Warning "Synthetic test files retained: $runDir" }
     if ($cleanupFailed) { throw 'WFP cleanup could not be confirmed.' }
 }

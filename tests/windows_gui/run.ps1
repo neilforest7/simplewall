@@ -178,6 +178,13 @@ WF_State=false
         if (-not $proc.WaitForExit(10000)) { Write-Error 'Could not stop the test application.' }
     }
     if ($started -and (Test-Path -LiteralPath $inventory)) { Assert-EmptyWfp }
-    if (Test-Path -LiteralPath $runDir) { Remove-Item -LiteralPath $runDir -Recurse -Force }
+    if (Test-Path -LiteralPath $runDir) {
+        $tempRoot = (Resolve-Path -LiteralPath $env:RUNNER_TEMP).ProviderPath.TrimEnd('\') + '\'
+        $resolvedRunDir = (Resolve-Path -LiteralPath $runDir).ProviderPath
+        if (-not $resolvedRunDir.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Refusing to remove a test directory outside RUNNER_TEMP.'
+        }
+        Remove-Item -LiteralPath $resolvedRunDir -Recurse -Force
+    }
 }
 Write-Host 'PASS: GUI validation and both saved rules verified in the portable profile after exit.'
