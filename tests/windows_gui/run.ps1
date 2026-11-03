@@ -25,6 +25,7 @@ public static class GuiNative {
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint id);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder text, int length);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr h);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, string s);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, StringBuilder s);
@@ -105,6 +106,12 @@ public static class GuiNative {
         EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == pid && IsWindowVisible(h)) list.Add(h); return true; }, IntPtr.Zero);
         return list.ToArray();
     }
+    public static IntPtr[] AllWindows(uint pid) {
+        var list = new List<IntPtr>();
+        EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == pid) list.Add(h); return true; }, IntPtr.Zero);
+        return list.ToArray();
+    }
+    public static string ClassName(IntPtr h) { var b = new StringBuilder(256); GetClassName(h, b, b.Capacity); return b.ToString(); }
     public static IntPtr Child(IntPtr parent, int id) {
         IntPtr result = IntPtr.Zero;
         EnumChildWindows(parent, (h, l) => { if (GetDlgCtrlID(h) == id) { result = h; return false; } return true; }, IntPtr.Zero);
@@ -204,12 +211,26 @@ WF_State=false
     Select-AutoTab $editor
     [void](Control $editor 339)
     Set-Text $editor 341 'CI Publisher & Co'
+    if ([GuiNative]::Text((Control $editor 337)) -ne '') { throw 'Filename should start empty.' }
     Command $editor 116
-    $warning = Wait-For {
-        foreach ($h in [GuiNative]::Windows([uint32]$proc.Id)) {
-            if ($h -ne $main -and $h -ne $editor -and [GuiNative]::Child($h, 1) -ne [IntPtr]::Zero) { return $h }
+    try {
+        $warning = Wait-For {
+            if (-not [GuiNative]::IsWindow($editor)) { throw 'Editor closed without the required filename warning.' }
+            foreach ($h in [GuiNative]::Windows([uint32]$proc.Id)) {
+                if ($h -ne $main -and $h -ne $editor -and [GuiNative]::Child($h, 1) -ne [IntPtr]::Zero) { return $h }
+            }
+        } 'required filename warning'
+    } catch {
+        foreach ($h in [GuiNative]::AllWindows([uint32]$proc.Id)) {
+            Write-Host ("GUI window: class={0}, visible={1}, title={2}, ok={3}" -f `
+                [GuiNative]::ClassName($h), [GuiNative]::IsWindowVisible($h), [GuiNative]::Text($h), [GuiNative]::Child($h, 1))
         }
-    } 'required filename warning'
+        if ([GuiNative]::IsWindow($editor)) {
+            Write-Host ("Editor values: rule={0}, filename={1}, publisher={2}" -f `
+                [GuiNative]::Text((Control $editor 210)), [GuiNative]::Text((Control $editor 337)), [GuiNative]::Text((Control $editor 341)))
+        }
+        throw
+    }
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($warning)
     $message = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,
         'Enter an executable name before specifying a directory or publisher.')
