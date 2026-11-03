@@ -304,6 +304,11 @@ int main(void) {
     _app_autoallow_refresh(NULL);
     assert(rule.auto_apps!=&old && rule.auto_apps->bits==0 && warnings==4);
     assert(calls==5); /* Committed partial error must not restore old membership. */
+    semantic_error=0; rule.match=1;
+    assert(_wfp_autoallow_app(NULL, &app, &log));
+    assert(rule.auto_apps->bits==2 && calls==6);
+    assert(_wfp_autoallow_app(NULL, &app, &log));
+    assert(calls==6); /* Repeated blocked events must not duplicate work. */
     puts("automatic membership rollback, retry, warning and committed-error checks passed");
     return 0;
 }
