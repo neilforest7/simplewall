@@ -217,7 +217,8 @@ WF_State=false
         $warning = Wait-For {
             if (-not [GuiNative]::IsWindow($editor)) { throw 'Editor closed without the required filename warning.' }
             foreach ($h in [GuiNative]::Windows([uint32]$proc.Id)) {
-                if ($h -ne $main -and $h -ne $editor -and [GuiNative]::Child($h, 1) -ne [IntPtr]::Zero) { return $h }
+                if ($h -ne $main -and $h -ne $editor -and [GuiNative]::ClassName($h) -eq '#32770' -and
+                    [GuiNative]::Text($h) -eq 'Error') { return $h }
             }
         } 'required filename warning'
     } catch {
