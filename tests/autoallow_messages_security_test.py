@@ -64,7 +64,9 @@ static void *_r_obj_findhashtable(PR_HASHTABLE t,ULONG_PTR h) {return (t && (t->
 static int has(PR_ARRAY a, GUID g) {for(size_t i=0;i<a->count;i++)if(a->items[i]==g)return 1;return 0;}
 static int _wfp_destroyfilters_array_silent(void *h,PR_ARRAY a,const wchar_t *f,int line) {
  (void)h;(void)f;(void)line;calls++; assert(!lock_rules && !lock_autoapps); assert(!has(a,4));
- if(fail)return 0;a->count=0;return 1;
+ if (fail) { return 0; }
+ a->count=0;
+ return 1;
 }
 '''
 helper_tests = r'''

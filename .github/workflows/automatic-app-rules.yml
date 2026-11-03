@@ -18,6 +18,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Exercise production guards
+        env:
+          CC: clang
         run: |
           python3 tests/autoallow_scope_test.py
           python3 tests/autoallow_xml_presence_test.py
