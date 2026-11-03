@@ -92,8 +92,17 @@ function Select-AutoTab([IntPtr]$Editor) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($Editor)
     $condition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty, 'Auto match')
-    $tab = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-    if (-not $tab) { throw 'The Auto match tab is not accessible on the desktop.' }
+    try {
+        $tab = Wait-For { $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition) } 'Auto match tab'
+    } catch {
+        $elements = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($element in $elements) {
+            Write-Host ("GUI element: type={0}, class={1}, id={2}, name={3}" -f `
+                $element.Current.ControlType.ProgrammaticName, $element.Current.ClassName, `
+                $element.Current.AutomationId, $element.Current.Name)
+        }
+        throw
+    }
     $pattern = $tab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
     $pattern.Select()
     $field = Control $Editor 337
