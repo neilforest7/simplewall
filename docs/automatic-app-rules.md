@@ -38,9 +38,14 @@ Verification performed during implementation:
 - The standalone matcher and its Windows test compiled and linked for Windows
   x64 with LLVM-MinGW 20261020 (`-Wall -Wextra -Werror`, ignoring MSVC-only
   library pragmas and linking those libraries explicitly).
-- That Windows executable has not been run here. Authenticode, filesystem and
-  WFP behavior still require Windows execution; the workflow is prepared for
-  the independent matcher tests.
+- The independent matcher also compiled with MSVC (`/W4 /WX`) and passed on
+  the GitHub Actions `windows-2025` runner. The tests covered filename and
+  directory matching, a valid embedded signature, a wrong publisher, unsigned
+  and modified files, and a directory symlink. The run reported no skipped cases.
+- The Linux and Windows jobs passed in
+  [Actions run 41688772076](https://github.com/neilforest7/simplewall/actions/runs/41688772076).
+  Full application compilation, UI operation and native WFP integration remain
+  unverified because the required application SDK is unavailable.
 
 ## Create a rule
 

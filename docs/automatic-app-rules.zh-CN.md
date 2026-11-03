@@ -10,6 +10,7 @@
 
 - 规则范围、XML 配置及撤销失败处理的三组回归测试已在 Linux 通过。
 - 独立匹配器及其测试已交叉编译、链接为 Windows x64 程序。
+- 独立匹配器也已在 GitHub 的 `windows-2025` 环境中通过 MSVC 编译和实际运行测试，涵盖名称、目录边界、有效签名、错误发布者、无签名、文件修改和目录符号链接；没有跳过项。[查看测试记录](https://github.com/neilforest7/simplewall/actions/runs/41688772076)。
 - 尚未完成完整应用的 Windows 编译和运行测试，此分支不是已经验证的发行版。
 
 完整构建存在上游依赖障碍：当前 Simplewall 使用的新版 `routine` SDK 已停止公开同步，公开 SDK 与当前应用源码的接口不一致。参见 [routine 说明](https://github.com/henrypp/routine) 和 [Simplewall #2027](https://github.com/henrypp/simplewall/issues/2027)。其中记录的旧版可构建组合为 Simplewall 3.8.5 与 routine `9e1357364e0e23e56adeed443ae7419c9659d43f`；本功能尚未移植到该组合。
