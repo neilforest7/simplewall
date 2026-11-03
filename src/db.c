@@ -1079,11 +1079,15 @@ VOID _app_db_save_app (
 )
 {
 	PITEM_APP ptr_app = NULL;
+	PR_STRING saved_path;
+	PR_STRING expanded_path;
 	ULONG_PTR enum_key = 0;
 	BOOLEAN is_keepunusedapps;
+	BOOLEAN is_savewithenvironment;
 	BOOLEAN is_usedapp;
 
 	is_keepunusedapps = _r_config_getboolean (L"IsKeepUnusedApps", TRUE);
+	is_savewithenvironment = _r_config_getboolean (L"IsSaveAppsWithEnvironment", TRUE);
 
 	_app_db_writeelementstart (db_info, L"apps");
 
@@ -1107,7 +1111,30 @@ VOID _app_db_save_app (
 		_r_xml_writewhitespace (&db_info->xml_library, L"\r\n\t\t");
 		_r_xml_writestartelement (&db_info->xml_library, L"item");
 
-		_r_xml_setattribute (&db_info->xml_library, L"path", ptr_app->original_path->buffer);
+		if (is_savewithenvironment)
+		{
+			saved_path = _r_str_environmentunexpandstring (&ptr_app->original_path->sr);
+
+			// Only use the abbreviated path if it expands back to the same path.
+			if (NT_SUCCESS (_r_str_environmentexpandstring (NULL, &saved_path->sr, &expanded_path)))
+			{
+				if (!_r_str_isequal (&expanded_path->sr, &ptr_app->original_path->sr, TRUE))
+					_r_obj_movereference (&saved_path, _r_obj_reference (ptr_app->original_path));
+
+				_r_obj_dereference (expanded_path);
+			}
+			else
+			{
+				_r_obj_movereference (&saved_path, _r_obj_reference (ptr_app->original_path));
+			}
+
+			_r_xml_setattribute (&db_info->xml_library, L"path", saved_path->buffer);
+			_r_obj_dereference (saved_path);
+		}
+		else
+		{
+			_r_xml_setattribute (&db_info->xml_library, L"path", ptr_app->original_path->buffer);
+		}
 
 		if (!_r_obj_isstringempty (ptr_app->hash) && _r_config_getboolean (L"IsHashesEnabled", FALSE))
 			_r_xml_setattribute (&db_info->xml_library, L"hash", ptr_app->hash->buffer);

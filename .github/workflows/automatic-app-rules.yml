@@ -24,6 +24,7 @@ jobs:
           python3 tests/autoallow_revoke_test.py
           python3 tests/autoallow_warning_test.py
           python3 tests/autoallow_main_test.py
+          python3 tests/profile_environment_test.py
 
   windows:
     name: Build and test full application
