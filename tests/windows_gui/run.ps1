@@ -236,7 +236,9 @@ WF_State=false
     $message = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,
         'Enter an executable name before specifying a directory or publisher.')
     if (-not $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $message)) { throw 'Unexpected validation warning.' }
-    Command $warning 1
+    if (-not [GuiNative]::PostMessage($warning, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) {
+        throw 'Could not close the validation warning.'
+    }
     [void](Wait-For { if (-not [GuiNative]::IsWindow($warning)) { $true } } 'validation warning to close')
     if (-not [GuiNative]::IsWindow($editor)) { throw 'Editor closed despite the missing required filename.' }
     Set-Text $editor 337 'ci-gui-publisher.exe'
