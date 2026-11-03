@@ -6,6 +6,15 @@
 static volatile LONG wfp_warning_pending = 0;
 static volatile LONG wfp_warning_scheduled = 0;
 
+static BOOLEAN _wfp_createappfilters_internal (
+	_In_ HANDLE engine_handle,
+	_In_ PR_LIST rules,
+	_In_ LPCWSTR file_name,
+	_In_ ULONG line,
+	_In_ BOOLEAN is_intransact,
+	_Out_opt_ PBOOLEAN out_fatal
+);
+
 static BOOLEAN _wfp_createrulefilters_internal (
 	_In_ HANDLE engine_handle,
 	_In_ PR_LIST rules,
@@ -149,14 +158,85 @@ HANDLE _wfp_getenginehandle ()
 	return engine_handle;
 }
 
+// This status check needs presence only. Bounded pages avoid copying every
+// system filter and retain the same all-layer semantics as _wfp_dumpfilters.
+static ULONG _wfp_hasproviderfilters (
+	_In_ HANDLE engine_handle,
+	_In_ LPCGUID provider_id,
+	_Out_ PBOOLEAN out_present
+)
+{
+	FWPM_FILTER0 **entries = NULL;
+	HANDLE enum_handle = NULL;
+	UINT32 returned = 0;
+	ULONG status, destroy_status;
+	const UINT32 page_size = 64;
+
+	*out_present = FALSE;
+	status = FwpmFilterCreateEnumHandle0 (engine_handle, NULL, &enum_handle);
+	if (status != ERROR_SUCCESS)
+		return status;
+
+	do
+	{
+		returned = 0;
+		status = FwpmFilterEnum0 (engine_handle, enum_handle, page_size, &entries, &returned);
+		if (status == ERROR_SUCCESS && returned && !entries)
+			status = ERROR_INVALID_DATA;
+
+		if (status == ERROR_SUCCESS)
+		{
+			for (UINT32 i = 0; i < returned; i++)
+			{
+				if (entries[i] && entries[i]->providerKey && IsEqualGUID (entries[i]->providerKey, provider_id))
+				{
+					*out_present = TRUE;
+					break;
+				}
+			}
+		}
+
+		if (entries)
+		{
+			FwpmFreeMemory0 ((PVOID_PTR)&entries);
+			entries = NULL;
+		}
+	}
+	while (status == ERROR_SUCCESS && !*out_present && returned == page_size);
+
+	destroy_status = FwpmFilterDestroyEnumHandle0 (engine_handle, enum_handle);
+	if (status == ERROR_SUCCESS && destroy_status != ERROR_SUCCESS)
+		status = destroy_status;
+
+	return status;
+}
+
 ENUM_INSTALL_TYPE _wfp_getinstalltype ()
 {
 	HANDLE engine_handle;
 	ENUM_INSTALL_TYPE install_type;
+	BOOLEAN is_present = FALSE;
+	ULONG status = ERROR_SUCCESS;
 
 	engine_handle = _wfp_getenginehandle ();
 
+	// Do not observe partially staged filters from another thread's transaction.
+	_r_queuedlock_acquireexclusive (&lock_transaction);
 	install_type = _wfp_isproviderinstalled (engine_handle);
+	if (install_type != INSTALL_DISABLED)
+	{
+		status = _wfp_hasproviderfilters (engine_handle, &GUID_WfpProvider, &is_present);
+		if (status != ERROR_SUCCESS || !is_present)
+			install_type = INSTALL_DISABLED;
+	}
+	_r_queuedlock_releaseexclusive (&lock_transaction);
+
+	// A query error cannot establish whether prior filters remain active.
+	if (status != ERROR_SUCCESS && status != ERROR_NOT_FOUND)
+	{
+		_r_log (LOG_LEVEL_ERROR, NULL, L"Firewall filter status query failed", status, NULL);
+		_wfp_warnruleupdate (_r_app_gethwnd ());
+	}
 
 	return install_type;
 }
@@ -425,7 +505,7 @@ CleanupExit:
 	return is_success;
 }
 
-VOID _wfp_uninitialize (
+BOOLEAN _wfp_uninitialize (
 	_In_ HANDLE engine_handle,
 	_In_ BOOLEAN is_full
 )
@@ -550,6 +630,8 @@ CleanupUninitialize:
 
 	if (!is_success)
 		_wfp_warnruleupdate (_r_app_gethwnd ());
+
+	return is_success;
 }
 
 // Pair each live GUID array with an owned copy. A transaction rollback restores
@@ -630,7 +712,7 @@ VOID _wfp_warnruleupdate (
 {
 	UNREFERENCED_PARAMETER (hwnd);
 	if (InterlockedExchange (&wfp_warning_pending, 1) == 0)
-		_r_log (LOG_LEVEL_ERROR, NULL, L"Firewall rule update failed", 0, L"Previous permissions may still be active. Retry the change or reapply filters.");
+		_r_log (LOG_LEVEL_ERROR, NULL, L"Firewall rule update failed", 0, L"Some intended protections may be missing. Previous permissions may still be active. Retry the change or reapply filters.");
 	_wfp_schedulewarning ();
 }
 
@@ -657,7 +739,7 @@ VOID _wfp_showwarning (
 	}
 
 	KillTimer (hwnd, WFP_WARNING_TIMER);
-	if (MessageBoxW (hwnd, L"Firewall rule update failed. Previous permissions may still be active. Retry the change or reapply filters.", L"simplewall", MB_OK | MB_ICONERROR))
+	if (MessageBoxW (hwnd, L"Firewall rule update failed. Some intended protections may be missing. Previous permissions may still be active. Retry the change or reapply filters.", L"simplewall", MB_OK | MB_ICONERROR))
 	{
 		InterlockedExchange (&wfp_warning_pending, 0);
 		InterlockedExchange (&wfp_warning_scheduled, 0);
@@ -674,7 +756,7 @@ VOID _wfp_showwarning (
 	}
 }
 
-VOID _wfp_installfilters (
+BOOLEAN _wfp_installfilters (
 	_In_ HANDLE engine_handle
 )
 {
@@ -684,7 +766,7 @@ VOID _wfp_installfilters (
 	PR_LIST rules, saved_apps, saved_rules, targets, copies, previous_autoapps;
 	LPCGUID guid;
 	ULONG_PTR enum_key = 0;
-	BOOLEAN is_committed = FALSE, is_fatal = FALSE, rule_fatal = FALSE;
+	BOOLEAN is_committed = FALSE, is_fatal = FALSE, rule_fatal = FALSE, app_fatal = FALSE, is_partial_error = FALSE;
 	ULONG status;
 
 	_r_queuedlock_acquireexclusive (&lock_autoallow);
@@ -783,8 +865,9 @@ VOID _wfp_installfilters (
 
 	if (!_r_obj_isempty2 (rules))
 	{
-		if (!_wfp_createappfilters (engine_handle, rules, DBG_ARG, TRUE))
-			is_fatal = TRUE;
+		if (!_wfp_createappfilters_internal (engine_handle, rules, DBG_ARG, TRUE, &app_fatal))
+			is_partial_error = TRUE;
+		is_fatal = is_fatal || app_fatal;
 		_r_obj_clearlist (rules);
 	}
 
@@ -798,10 +881,9 @@ VOID _wfp_installfilters (
 
 	if (!_r_obj_isempty2 (rules))
 	{
-		// A malformed/missing rule member is recoverable: retain successful
-		// rules and the baseline blocks. Failed automatic grants are removed
-		// locally; only a failed cleanup makes the entire transaction unsafe.
-		_wfp_createrulefilters_internal (engine_handle, rules, DBG_ARG, TRUE, &rule_fatal);
+		// Failed block rules must abort; incomplete automatic permits are removed.
+		if (!_wfp_createrulefilters_internal (engine_handle, rules, DBG_ARG, TRUE, &rule_fatal))
+			is_partial_error = TRUE;
 		is_fatal = is_fatal || rule_fatal;
 		_r_obj_clearlist (rules);
 	}
@@ -873,8 +955,10 @@ CleanupInstall:
 	_r_obj_dereference (rules);
 	_r_queuedlock_releaseexclusive (&lock_autoallow);
 
-	if (!is_committed)
+	if (!is_committed || is_partial_error)
 		_wfp_warnruleupdate (_r_app_gethwnd ());
+
+	return is_committed && !is_partial_error;
 }
 
 BOOLEAN _wfp_transact_start (
@@ -1156,7 +1240,7 @@ VOID _wfp_clearfilter_ids ()
 	_r_queuedlock_releaseshared (&lock_rules);
 }
 
-VOID _wfp_destroyfilters (
+BOOLEAN _wfp_destroyfilters (
 	_In_ HANDLE engine_handle
 )
 {
@@ -1182,9 +1266,11 @@ VOID _wfp_destroyfilters (
 
 	if (!is_success)
 		_wfp_warnruleupdate (_r_app_gethwnd ());
+
+	return is_success;
 }
 
-BOOLEAN _wfp_destroyfilters_array (
+BOOLEAN _wfp_destroyfilters_array_silent (
 	_In_ HANDLE engine_handle,
 	_In_ PR_ARRAY guids,
 	_In_ LPCWSTR file_name,
@@ -1192,12 +1278,11 @@ BOOLEAN _wfp_destroyfilters_array (
 )
 {
 	LPCGUID guid;
-	BOOLEAN is_enabled, is_success = FALSE;
+	BOOLEAN is_success = FALSE;
 
 	if (_r_obj_isempty2 (guids))
 		return TRUE;
 
-	is_enabled = _r_queuedlock_islocked (&lock_apply) ? FALSE : _app_initinterfacestate (_r_app_gethwnd (), FALSE);
 	_r_queuedlock_acquireexclusive (&lock_transaction);
 
 	for (ULONG_PTR i = 0; i < _r_obj_getarraysize (guids); i++)
@@ -1245,8 +1330,25 @@ CleanupDelete:
 	}
 
 	_r_queuedlock_releaseexclusive (&lock_transaction);
-	_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
 
+	return is_success;
+}
+
+BOOLEAN _wfp_destroyfilters_array (
+	_In_ HANDLE engine_handle,
+	_Inout_ PR_ARRAY guids,
+	_In_ LPCWSTR file_name,
+	_In_ ULONG line
+)
+{
+	BOOLEAN is_enabled, is_success;
+
+	if (_r_obj_isempty2 (guids))
+		return TRUE;
+
+	is_enabled = (_r_queuedlock_islocked (&lock_apply) || !_r_app_gethwnd ()) ? FALSE : _app_initinterfacestate (_r_app_gethwnd (), FALSE);
+	is_success = _wfp_destroyfilters_array_silent (engine_handle, guids, DBG_ARG_VAR);
+	_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
 	return is_success;
 }
 
@@ -1963,6 +2065,8 @@ static BOOLEAN _wfp_createrulefilters_internal (
 		{
 			ptr_rule->is_haveerrors = TRUE;
 			is_success = FALSE;
+			if (ptr_rule->action == FWP_ACTION_BLOCK)
+				is_abort = TRUE;
 			continue;
 		}
 
@@ -2100,6 +2204,9 @@ static BOOLEAN _wfp_createrulefilters_internal (
 		{
 			is_success = FALSE;
 
+			if (ptr_rule->action == FWP_ACTION_BLOCK)
+				is_abort = TRUE;
+
 			if (_app_rule_hasauto (ptr_rule))
 			{
 				for (ULONG_PTR j = 0; j < _r_obj_getarraysize (ptr_rule->guids); j++)
@@ -2174,12 +2281,65 @@ BOOLEAN _wfp_createappfilters (
 	_In_ BOOLEAN is_intransact
 )
 {
+	PITEM_APP ptr_app, current_app;
+	BOOLEAN is_enabled = FALSE, is_success = TRUE;
+
+	if (_r_obj_isempty (rules))
+		return FALSE;
+
+	if (!is_intransact)
+	{
+		if (!_r_queuedlock_islocked (&lock_apply) && _r_app_gethwnd ())
+			is_enabled = _app_initinterfacestate (_r_app_gethwnd (), FALSE);
+
+		_r_queuedlock_acquireexclusive (&lock_autoallow);
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
+		{
+			ptr_app = _r_obj_getlistitem (rules, i);
+			if (!ptr_app)
+				continue;
+
+			current_app = _app_getappitem (ptr_app->app_hash);
+			if (current_app != ptr_app)
+			{
+				ptr_app->is_haveerrors = TRUE;
+				is_success = FALSE;
+			}
+			if (current_app)
+				_r_obj_dereference (current_app);
+		}
+	}
+
+	if (is_success)
+		is_success = _wfp_createappfilters_internal (engine_handle, rules, DBG_ARG_VAR, is_intransact, NULL);
+
+	if (!is_intransact)
+	{
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
+		_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
+	}
+
+	return is_success;
+}
+
+static BOOLEAN _wfp_createappfilters_internal (
+	_In_ HANDLE engine_handle,
+	_In_ PR_LIST rules,
+	_In_ LPCWSTR file_name,
+	_In_ ULONG line,
+	_In_ BOOLEAN is_intransact,
+	_Out_opt_ PBOOLEAN out_fatal
+)
+{
 	PR_LIST copies = _r_obj_createlist (0x10, &_r_obj_dereference);
 	PR_ARRAY old_ids;
 	PITEM_APP ptr_app;
 	PR_STRING string;
 	LPCGUID guid;
-	BOOLEAN is_enabled = FALSE, is_success = TRUE;
+	BOOLEAN is_success = TRUE, is_cleanup_failed = FALSE;
+
+	if (out_fatal)
+		*out_fatal = FALSE;
 
 	if (_r_obj_isempty (rules))
 	{
@@ -2189,7 +2349,6 @@ BOOLEAN _wfp_createappfilters (
 
 	if (!is_intransact)
 	{
-		is_enabled = _app_initinterfacestate (_r_app_gethwnd (), FALSE);
 		_r_queuedlock_acquireexclusive (&lock_transaction);
 		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
 		{
@@ -2232,11 +2391,26 @@ BOOLEAN _wfp_createappfilters (
 		if (!ptr_app->is_enabled)
 			continue;
 		string = _app_getappdisplayname (ptr_app, TRUE);
-		if (!_wfp_createrulefilter (engine_handle, ptr_app->type, _r_obj_getstring (string), ptr_app->app_hash,
+		if (!ptr_app->app_hash || !_wfp_createrulefilter (engine_handle, ptr_app->type, _r_obj_getstring (string), ptr_app->app_hash,
 			NULL, NULL, NULL, FW_WEIGHT_APP, FWP_ACTION_PERMIT, 0, ptr_app->guids))
 		{
 			ptr_app->is_haveerrors = TRUE;
 			is_success = FALSE;
+			_r_log (LOG_LEVEL_ERROR, NULL, L"Application allow filter failed", 0, _r_obj_getstring (string));
+
+			if (is_intransact)
+			{
+				// An application may have created only some layers. Do not
+				// retain a partial permit when continuing the installation.
+				for (ULONG_PTR j = 0; j < _r_obj_getarraysize (ptr_app->guids); j++)
+				{
+					guid = _r_obj_getarrayitem (ptr_app->guids, j);
+					if (!_wfp_deletefilter (engine_handle, guid, DBG_ARG_VAR))
+						is_cleanup_failed = TRUE;
+				}
+				if (!is_cleanup_failed)
+					_r_obj_cleararray (ptr_app->guids);
+			}
 		}
 		if (string)
 			_r_obj_dereference (string);
@@ -2270,9 +2444,10 @@ CleanupApps:
 			}
 		}
 		_r_queuedlock_releaseexclusive (&lock_transaction);
-		_app_restoreinterfacestate (_r_app_gethwnd (), is_enabled);
 	}
 	_r_obj_dereference (copies);
+	if (out_fatal)
+		*out_fatal = is_cleanup_failed;
 	return is_success;
 }
 
@@ -3272,14 +3447,16 @@ VOID NTAPI _wfp_applythread (
 	{
 		if (_wfp_initialize (context->hwnd, engine_handle))
 			_wfp_installfilters (engine_handle);
+		else
+			_wfp_warnruleupdate (context->hwnd);
 	}
 	else
 	{
 		if (_r_sys_isosversiongreaterorequal (WINDOWS_10))
 			_app_wufixenable (context->hwnd, FALSE);
 
-		_wfp_destroyfilters (engine_handle);
-		_wfp_uninitialize (engine_handle, TRUE);
+		if (_wfp_destroyfilters (engine_handle))
+			_wfp_uninitialize (engine_handle, TRUE);
 	}
 
 	// dropped packets logging (win7+)

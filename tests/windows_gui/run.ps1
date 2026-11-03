@@ -115,6 +115,9 @@ try {
     } finally { Pop-Location }
     Assert-EmptyWfp
     Copy-Item -LiteralPath $source -Destination $app
+    $locale = Join-Path $PSScriptRoot '../../bin/simplewall.lng'
+    if (-not (Test-Path -LiteralPath $locale -PathType Leaf)) { throw 'Built language file is missing.' }
+    Copy-Item -LiteralPath $locale -Destination (Join-Path $appDir 'simplewall.lng')
     @'
 [simplewall]
 Language=English

@@ -63,21 +63,20 @@ affect connectivity before enumeration. A successful GitHub request also does
 not establish connectivity to every Actions service. Only run the tested build
 on a fresh disposable VM, without secrets.
 
-Cleanup uses the application's own uninstall path. A small helper confirms the
-uninstall dialog belonging to that process and unchecks its optional Windows
-Firewall change. The script then independently inventories the provider,
-sublayer, callouts and filters, and fails if removal cannot be established.
+Cleanup uses the application's `-uninstall -silent -portable` command and
+requires a zero exit code. It independently inventories the provider, sublayer,
+callouts and filters, and fails if removal cannot be established.
 Cleanup is attempted in `finally` after a timeout or assertion failure too.
 If the runner or job is forcibly terminated, `finally` may not execute; `-temp`
 objects are static rather than tied to a dynamic WFP session, so they can remain
 until removed or the VM is discarded. The application can also touch WFP engine
 security or net-event options; this test does not snapshot or restore them.
-Uninstall UI automation and cleanup failures must be inspected in the job log.
+Cleanup failures must be inspected in the job log.
 
 Publisher matching, first-block discovery, graphical editing, runtime exclusion,
 and the behavior of an abruptly terminated runner are not covered. The dynamic
 block is removed by BFE when the helper session closes, including helper death;
 the script additionally checks its specific filter key before app uninstall.
 
-These scripts have not yet run on GitHub-hosted Windows. A successful local
-syntax check does not establish that they compile or that the product passes.
+The WFP assertions passed on a GitHub-hosted Windows VM in run 41706975514;
+that run's dialog-based cleanup failed. Silent cleanup requires a new CI run.

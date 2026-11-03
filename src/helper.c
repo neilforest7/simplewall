@@ -1079,14 +1079,16 @@ CleanupExit:
 		_r_sys_freelibrary (hlib);
 }
 
+// Returns a reference owned by the caller. File IO must remain outside lock_apps.
 PR_STRING _app_getfilehashinfo (
 	_In_ HANDLE hfile,
 	_In_ ULONG_PTR app_hash
 )
 {
-	PITEM_APP ptr_app;
-	PR_STRING string;
+	PITEM_APP ptr_app, current_app;
+	PR_STRING string = NULL;
 	NTSTATUS status;
+	BOOLEAN is_current;
 
 	ptr_app = _app_getappitem (app_hash);
 
@@ -1095,9 +1097,35 @@ PR_STRING _app_getfilehashinfo (
 
 	status = _r_crypt_getfilehash (BCRYPT_SHA256_ALGORITHM, NULL, hfile, &string);
 
-	_r_obj_movereference (&ptr_app->hash, string);
+	if (!NT_SUCCESS (status) || !string)
+	{
+		_r_obj_dereference (ptr_app);
+		return NULL;
+	}
 
-	return ptr_app->hash;
+	_r_queuedlock_acquireexclusive (&lock_apps);
+	current_app = _r_obj_findhashtablepointer (apps_table, app_hash);
+	is_current = (current_app == ptr_app);
+
+	// File information may initialize a baseline, but must not replace one
+	// that the monitor still needs to compare against.
+	if (is_current && !ptr_app->hash)
+		ptr_app->hash = _r_obj_reference (string);
+
+	_r_queuedlock_releaseexclusive (&lock_apps);
+
+	if (current_app)
+		_r_obj_dereference (current_app);
+
+	_r_obj_dereference (ptr_app);
+
+	if (!is_current)
+	{
+		_r_obj_dereference (string);
+		return NULL;
+	}
+
+	return string;
 }
 
 ULONG_PTR _app_addcolor (
@@ -1694,65 +1722,120 @@ PR_STRING _app_resolveaddress_interlocked (
 	return current_string;
 }
 
-VOID _app_fileloggingenable ()
+// The session owns its stop event until the monitor thread exits. The control
+// lock is never held across file IO, app locks, or WFP work.
+typedef struct _APP_MONITOR_SESSION
 {
-	BOOLEAN is_enable;
-	NTSTATUS status;
+	HANDLE stop_event;
+	volatile LONG references;
+} APP_MONITOR_SESSION, *PAPP_MONITOR_SESSION;
 
-	is_enable = _r_config_getboolean (L"IsEnableAppMonitor", FALSE);
+static SRWLOCK _app_monitor_lock = SRWLOCK_INIT;
+static PAPP_MONITOR_SESSION _app_monitor_session = NULL;
+static volatile LONG _app_monitor_outstanding = 0;
 
-	if (is_enable)
+static VOID _app_monitor_release (_In_ PAPP_MONITOR_SESSION session)
+{
+	if (InterlockedDecrement (&session->references) == 0)
 	{
-		status = _r_sys_createthread (&config.hmonitor_thread, NtCurrentProcess (), &_app_timercallback, NULL, NULL, L"FileMonitor");
-
-		if (NT_SUCCESS (status))
-			NtResumeThread (config.hmonitor_thread, NULL);
-	}
-	else
-	{
-		if (config.hmonitor_thread)
-		{
-			NtTerminateThread (config.hmonitor_thread, 0);
-			NtClose (config.hmonitor_thread);
-
-			config.hmonitor_thread = NULL;
-		}
+		CloseHandle (session->stop_event);
+		_r_mem_free (session);
 	}
 }
 
-// The monitor can be forcibly stopped by its existing settings path. Keep new
-// matching/transaction locks on a workqueue worker that is not terminated there.
-static VOID NTAPI _app_monitorchanged (
-	_In_ PVOID context
-)
+// Poll after stopping; file IO or an admitted rule update may still be running.
+BOOLEAN _app_monitor_isbusy ()
 {
-	PITEM_APP ptr_app = (PITEM_APP)context;
-	HWND hwnd;
+	return InterlockedCompareExchange (&_app_monitor_outstanding, 0, 0) != 0;
+}
 
-	hwnd = _r_app_gethwnd ();
+BOOLEAN _app_monitor_isrunning ()
+{
+	BOOLEAN is_running;
 
-	_r_queuedlock_acquireexclusive (&lock_autoallow);
-	ptr_app->is_autoallow_blocked = TRUE;
-	_r_queuedlock_releaseexclusive (&lock_autoallow);
+	AcquireSRWLockShared (&_app_monitor_lock);
+	is_running = (_app_monitor_session != NULL);
+	ReleaseSRWLockShared (&_app_monitor_lock);
+	return is_running;
+}
 
-	_app_setappinfo (ptr_app, INFO_DISABLE, NULL);
-	_app_autoallow_refresh (hwnd);
-	_app_profile_save (hwnd);
+VOID _app_monitor_stop ()
+{
+	PAPP_MONITOR_SESSION session;
 
-	_r_obj_dereference (ptr_app);
+	AcquireSRWLockExclusive (&_app_monitor_lock);
+	session = _app_monitor_session;
+	if (session)
+	{
+		_app_monitor_session = NULL;
+		SetEvent (session->stop_event);
+	}
+	ReleaseSRWLockExclusive (&_app_monitor_lock);
+
+	if (session)
+		_app_monitor_release (session);
+}
+
+VOID _app_fileloggingenable ()
+{
+	PAPP_MONITOR_SESSION session;
+	NTSTATUS status;
+
+	if (!_r_config_getboolean (L"IsEnableAppMonitor", FALSE))
+	{
+		_app_monitor_stop ();
+		return;
+	}
+
+	AcquireSRWLockExclusive (&_app_monitor_lock);
+	// Never overlap a new monitor with a stopped thread that is still draining.
+	if (_app_monitor_session || _app_monitor_isbusy ())
+	{
+		ReleaseSRWLockExclusive (&_app_monitor_lock);
+		return;
+	}
+
+	session = _r_mem_allocate (sizeof (APP_MONITOR_SESSION));
+	session->stop_event = CreateEventW (NULL, TRUE, FALSE, NULL);
+	if (!session->stop_event)
+	{
+		_r_mem_free (session);
+		ReleaseSRWLockExclusive (&_app_monitor_lock);
+		return;
+	}
+
+	session->references = 2; // current session and monitor thread
+	_app_monitor_session = session;
+	InterlockedIncrement (&_app_monitor_outstanding);
+	status = _r_sys_createthread (NULL, NtCurrentProcess (), &_app_timercallback, session, NULL, L"FileMonitor");
+	if (!NT_SUCCESS (status))
+	{
+		_app_monitor_session = NULL;
+		InterlockedDecrement (&_app_monitor_outstanding);
+	}
+	ReleaseSRWLockExclusive (&_app_monitor_lock);
+
+	if (!NT_SUCCESS (status))
+	{
+		_app_monitor_release (session);
+		_app_monitor_release (session);
+	}
 }
 
 NTSTATUS NTAPI _app_timercallback (
 	_In_opt_ PVOID context
 )
 {
-	PITEM_APP ptr_app = NULL;
-	PR_STRING hash;
+	PAPP_MONITOR_SESSION session = (PAPP_MONITOR_SESSION)context;
+	PITEM_APP ptr_app = NULL, current_app;
+	PR_STRING baseline, hash;
 	PR_LIST applications;
 	ULONG_PTR enum_key;
 	NTSTATUS status;
+	BOOLEAN is_changed, is_current;
+	HWND hwnd;
 
-	while (TRUE)
+	while (WaitForSingleObject (session->stop_event, 0) == WAIT_TIMEOUT)
 	{
 		applications = _r_obj_createlist (0x10, &_r_obj_dereference);
 		_r_queuedlock_acquireshared (&lock_apps);
@@ -1768,31 +1851,89 @@ NTSTATUS NTAPI _app_timercallback (
 
 		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (applications); i++)
 		{
+			if (WaitForSingleObject (session->stop_event, 0) != WAIT_TIMEOUT)
+				break;
+
 			ptr_app = (PITEM_APP)_r_obj_getlistitem (applications, i);
 
 			if (!_app_isappvalidbinary (ptr_app->real_path) || !_app_isappused (ptr_app))
 				continue;
 
+			// Capture the baseline before file IO so a concurrent refresh cannot
+			// hide a change by replacing the current hash while we are hashing.
+			_r_queuedlock_acquireshared (&lock_apps);
+			current_app = _r_obj_findhashtablepointer (apps_table, ptr_app->app_hash);
+			baseline = (current_app == ptr_app) ? _r_obj_referencesafe (ptr_app->hash) : NULL;
+			_r_queuedlock_releaseshared (&lock_apps);
+
+			if (current_app)
+				_r_obj_dereference (current_app);
+
+			if (!baseline)
+				continue;
+
+			hash = NULL;
 			status = _r_crypt_getfilehash (BCRYPT_SHA256_ALGORITHM, &ptr_app->real_path->sr, NULL, &hash);
 
-			if (NT_SUCCESS (status))
+			if (!NT_SUCCESS (status) || !hash)
 			{
-				if (!_r_str_isequal (&ptr_app->hash->sr, &hash->sr, TRUE))
+				_r_obj_dereference (baseline);
+				continue;
+			}
+
+			if (WaitForSingleObject (session->stop_event, 0) != WAIT_TIMEOUT)
+			{
+				_r_obj_dereference (baseline);
+				_r_obj_dereference (hash);
+				break;
+			}
+
+			is_changed = !_r_str_isequal (&baseline->sr, &hash->sr, TRUE);
+			is_current = FALSE;
+
+			if (is_changed)
+			{
+				_r_queuedlock_acquireexclusive (&lock_apps);
+				current_app = _r_obj_findhashtablepointer (apps_table, ptr_app->app_hash);
+				is_current = (current_app == ptr_app);
+
+				// Do not overwrite a hash installed after the snapshot.
+				if (is_current && ptr_app->hash && _r_str_isequal (&ptr_app->hash->sr, &baseline->sr, TRUE))
 				{
 					_r_obj_movereference (&ptr_app->hash, hash);
-					_r_workqueue_queueitem (&file_queue, &_app_monitorchanged, _r_obj_reference (ptr_app));
+					hash = NULL;
 				}
-				else
-				{
-					_r_obj_dereference (hash);
-				}
+
+				_r_queuedlock_releaseexclusive (&lock_apps);
+
+				if (current_app)
+					_r_obj_dereference (current_app);
+			}
+
+			_r_obj_dereference (baseline);
+			if (hash)
+				_r_obj_dereference (hash);
+
+			if (is_changed && is_current)
+			{
+				hwnd = _r_app_gethwnd ();
+				_r_queuedlock_acquireexclusive (&lock_autoallow);
+				ptr_app->is_autoallow_blocked = TRUE;
+				_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+				_app_setappinfo (ptr_app, INFO_DISABLE, NULL);
+				_app_autoallow_refresh (hwnd);
+				_app_profile_save (hwnd);
 			}
 		}
 
 		_r_obj_dereference (applications);
-		_r_sys_waitforsingleobject (NtCurrentThread (), _r_calc_minutes2milliseconds (10));
+		if (WaitForSingleObject (session->stop_event, _r_calc_minutes2milliseconds (10)) != WAIT_TIMEOUT)
+			break;
 	}
 
+	_app_monitor_release (session);
+	InterlockedDecrement (&_app_monitor_outstanding);
 	return STATUS_SUCCESS;
 }
 
@@ -1863,6 +2004,7 @@ VOID NTAPI _app_queue_fileinformation (
 )
 {
 	PITEM_APP_INFO ptr_app_info;
+	PR_STRING hash;
 	HANDLE hfile;
 	HWND hwnd;
 	NTSTATUS status;
@@ -1895,7 +2037,12 @@ VOID NTAPI _app_queue_fileinformation (
 
 	// query sha256 info
 	if (_r_config_getboolean (L"IsHashesEnabled", FALSE))
-		_app_getfilehashinfo (hfile, ptr_app_info->app_hash);
+	{
+		hash = _app_getfilehashinfo (hfile, ptr_app_info->app_hash);
+
+		if (hash)
+			_r_obj_dereference (hash);
+	}
 
 	// redraw listview
 	if (_r_wnd_isvisible (hwnd, FALSE))

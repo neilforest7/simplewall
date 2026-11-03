@@ -403,6 +403,7 @@ typedef uint8_t BOOLEAN;
 typedef int64_t LONG64, *PLONG64;
 typedef uintptr_t ULONG_PTR;
 typedef void *PVOID;
+typedef void *HANDLE;
 typedef struct { int count; } ARRAY, *PR_ARRAY;
 typedef struct {
     void *bytes, *comment, *hash;
@@ -415,16 +416,18 @@ typedef enum {
     INFO_BYTES_DATA, INFO_COMMENT, INFO_HASH, INFO_TIMESTAMP, INFO_TIMER,
     INFO_DISABLE, INFO_IS_ENABLED, INFO_IS_SILENT, INFO_IS_UNDELETABLE
 } ENUM_INFO_DATA;
-static int failure, warnings, updates, revokes;
-static void *_wfp_getenginehandle(void) { return NULL; }
-static BOOLEAN _wfp_destroyfilters_array(void *engine, PR_ARRAY ids, const wchar_t *file, int line) {
-    (void)engine; (void)file; (void)line; ++revokes;
+static int failure, warnings, updates, revokes, lock_apps, lock_autoallow;
+static void _r_queuedlock_acquireexclusive(int *lock) { assert((lock == &lock_apps || lock == &lock_autoallow) && !*lock); *lock = 1; }
+static void _r_queuedlock_releaseexclusive(int *lock) { assert((lock == &lock_apps || lock == &lock_autoallow) && *lock); *lock = 0; }
+static void *_wfp_getenginehandle(void) { assert(!lock_autoallow); return NULL; }
+static BOOLEAN _wfp_destroyfilters_array_silent(void *engine, PR_ARRAY ids, const wchar_t *file, int line) {
+    (void)engine; (void)file; (void)line; assert(lock_autoallow); ++revokes;
     if (failure) return FALSE;
     ids->count = 0; return TRUE;
 }
 static void *_r_app_gethwnd(void) { return NULL; }
-static void _r_show_message(void *hwnd, int flags, void *title, const wchar_t *message) {
-    (void)hwnd; (void)flags; (void)title; assert(message && *message); ++warnings;
+static void _wfp_warnruleupdate(void *hwnd) {
+    (void)hwnd; assert(!lock_autoallow); ++warnings;
 }
 static void _app_listview_updateitemby_param(void *hwnd, ULONG_PTR hash, int is_app) {
     (void)hwnd; (void)hash; (void)is_app; ++updates;
@@ -438,6 +441,9 @@ int main(void) {
     ARRAY ids = {2};
     ITEM_APP app = {0};
     LONG64 expired = 50;
+    int hash_value = 42;
+    _app_setappinfo(&app, INFO_HASH, &hash_value);
+    assert(app.hash == &hash_value && !lock_apps);
     app.guids = &ids; app.is_enabled = TRUE; app.timer = 75;
     failure = TRUE;
     _app_setappinfo(&app, INFO_DISABLE, NULL);
@@ -454,6 +460,10 @@ int main(void) {
     _app_setappinfo(&app, INFO_DISABLE, NULL);
     assert(ids.count == 0 && !app.is_enabled && app.timer == 75);
     assert(warnings == 2 && updates == 4 && revokes == 4);
+    ids.count = 2; app.is_enabled = TRUE; app.timer = 0; failure = TRUE;
+    _app_setappinfo(&app, INFO_TIMER, &expired);
+    assert(ids.count == 2 && app.is_enabled && app.timer == expired && app.is_haveerrors);
+    assert(warnings == 3 && updates == 5 && revokes == 5 && !lock_autoallow);
     puts("Application revoke failure preserves filter IDs and state");
     return 0;
 }

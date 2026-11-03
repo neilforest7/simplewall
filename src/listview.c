@@ -73,25 +73,52 @@ VOID _app_listview_additems (
 )
 {
 	PITEM_APP ptr_app = NULL;
+	PITEM_APP current_app;
 	PITEM_RULE ptr_rule;
-	LONG64 current_time;
+	PR_LIST applications;
+	LONG64 deadline;
+	LONG64 seconds;
 	ULONG_PTR enum_key = 0;
+	BOOLEAN is_timer_failed = FALSE;
 
-	current_time = _r_unixtime_now ();
-
-	// add apps
+	applications = _r_obj_createlist (10, &_r_obj_dereference);
 	_r_queuedlock_acquireshared (&lock_apps);
 
 	while (_r_obj_enumhashtablepointer (apps_table, &ptr_app, NULL, &enum_key))
-	{
-		_app_listview_addappitem (hwnd, ptr_app);
-
-		// install timer
-		if (ptr_app->timer)
-			_app_timer_set (hwnd, ptr_app, ptr_app->timer - current_time);
-	}
+		_r_obj_addlistitem (applications, _r_obj_reference (ptr_app));
 
 	_r_queuedlock_releaseshared (&lock_apps);
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (applications); i++)
+	{
+		ptr_app = _r_obj_getlistitem (applications, i);
+		_app_listview_addappitem (hwnd, ptr_app);
+
+		_r_queuedlock_acquireexclusive (&lock_autoallow);
+		current_app = _app_getappitem (ptr_app->app_hash);
+
+		if (current_app == ptr_app && ptr_app->timer && !ptr_app->htimer)
+		{
+			deadline = ptr_app->timer;
+			seconds = deadline - _r_unixtime_now ();
+			_app_timer_set (NULL, ptr_app, seconds > 0 ? seconds : 1);
+
+			if (ptr_app->htimer)
+				ptr_app->timer = deadline;
+			else
+				is_timer_failed = TRUE;
+		}
+
+		if (current_app)
+			_r_obj_dereference (current_app);
+
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
+	}
+
+	_r_obj_dereference (applications);
+
+	if (is_timer_failed)
+		_wfp_warnruleupdate (hwnd);
 
 	// add rules
 	_r_queuedlock_acquireshared (&lock_rules);

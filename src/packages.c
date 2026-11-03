@@ -270,6 +270,62 @@ CleanupExit:
 		NtClose (hsubkey);
 }
 
+static VOID _app_package_populatelist (
+	_In_ HWND hwnd,
+	_In_ ENUM_TYPE_DATA type
+)
+{
+	PITEM_APP ptr_app = NULL;
+	PITEM_APP current_app;
+	PR_LIST applications;
+	LONG64 deadline;
+	LONG64 seconds;
+	ULONG_PTR enum_key = 0;
+	BOOLEAN is_timer_failed = FALSE;
+
+	applications = _r_obj_createlist (10, &_r_obj_dereference);
+	_r_queuedlock_acquireshared (&lock_apps);
+
+	while (_r_obj_enumhashtablepointer (apps_table, &ptr_app, NULL, &enum_key))
+	{
+		if (ptr_app->type == type)
+			_r_obj_addlistitem (applications, _r_obj_reference (ptr_app));
+	}
+
+	_r_queuedlock_releaseshared (&lock_apps);
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (applications); i++)
+	{
+		ptr_app = _r_obj_getlistitem (applications, i);
+		_app_listview_addappitem (hwnd, ptr_app);
+
+		_r_queuedlock_acquireexclusive (&lock_autoallow);
+		current_app = _app_getappitem (ptr_app->app_hash);
+
+		if (current_app == ptr_app && ptr_app->timer && !ptr_app->htimer)
+		{
+			deadline = ptr_app->timer;
+			seconds = deadline - _r_unixtime_now ();
+			_app_timer_set (NULL, ptr_app, seconds > 0 ? seconds : 1);
+
+			if (ptr_app->htimer)
+				ptr_app->timer = deadline;
+			else
+				is_timer_failed = TRUE;
+		}
+
+		if (current_app)
+			_r_obj_dereference (current_app);
+
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
+	}
+
+	_r_obj_dereference (applications);
+
+	if (is_timer_failed)
+		_wfp_warnruleupdate (hwnd);
+}
+
 NTSTATUS NTAPI _app_package_threadproc (
 	_In_ PVOID arglist
 )
@@ -280,10 +336,7 @@ NTSTATUS NTAPI _app_package_threadproc (
 	HANDLE event_handle1 = NULL;
 	HANDLE event_handle2 = NULL;
 	HANDLE hevents[2] = {0};
-	PITEM_APP ptr_app = NULL;
 	HWND hwnd;
-	LONG64 current_time;
-	ULONG_PTR enum_key = 0;
 	ULONG flags = REG_NOTIFY_CHANGE_NAME;
 	NTSTATUS status;
 
@@ -336,26 +389,7 @@ NTSTATUS NTAPI _app_package_threadproc (
 
 				_app_package_getserviceslist (hwnd);
 
-				// add apps
-				current_time = _r_unixtime_now ();
-
-				enum_key = 0;
-
-				_r_queuedlock_acquireshared (&lock_apps);
-
-				while (_r_obj_enumhashtablepointer (apps_table, &ptr_app, NULL, &enum_key))
-				{
-					if (ptr_app->type == DATA_APP_SERVICE)
-					{
-						_app_listview_addappitem (hwnd, ptr_app);
-
-						// install timer
-						if (ptr_app->timer)
-							_app_timer_set (hwnd, ptr_app, ptr_app->timer - current_time);
-					}
-				}
-
-				_r_queuedlock_releaseshared (&lock_apps);
+				_app_package_populatelist (hwnd, DATA_APP_SERVICE);
 
 				NtNotifyChangeKey (hservices_key, event_handle1, NULL, NULL, &isb, flags, TRUE, NULL, 0, TRUE); // reset
 			}
@@ -365,26 +399,7 @@ NTSTATUS NTAPI _app_package_threadproc (
 
 				_app_package_getpackageslist (hwnd);
 
-				// add apps
-				current_time = _r_unixtime_now ();
-
-				enum_key = 0;
-
-				_r_queuedlock_acquireshared (&lock_apps);
-
-				while (_r_obj_enumhashtablepointer (apps_table, &ptr_app, NULL, &enum_key))
-				{
-					if (ptr_app->type == DATA_APP_UWP)
-					{
-						_app_listview_addappitem (hwnd, ptr_app);
-
-						// install timer
-						if (ptr_app->timer)
-							_app_timer_set (hwnd, ptr_app, ptr_app->timer - current_time);
-					}
-				}
-
-				_r_queuedlock_releaseshared (&lock_apps);
+				_app_package_populatelist (hwnd, DATA_APP_UWP);
 
 				if (hpackages_key)
 					NtNotifyChangeKey (hpackages_key, event_handle2, NULL, NULL, &isb, flags, TRUE, NULL, 0, TRUE); // reset

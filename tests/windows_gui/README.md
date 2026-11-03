@@ -12,7 +12,7 @@ From the repository root, after the build:
 pwsh -NoProfile -File tests/windows_gui/run.ps1 -SimplewallExe bin/64/simplewall.exe
 ```
 
-The script copies only the executable into a fresh directory under RUNNER_TEMP,
+The script copies the executable and built language file into a fresh directory under RUNNER_TEMP,
 creates a portable English configuration, and starts the GUI with `-portable`.
 It checks that the process and the simplewall WFP provider, sublayer, provider
 callouts, and provider/sublayer filters are absent before startup. It opens the

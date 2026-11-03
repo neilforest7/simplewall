@@ -9,6 +9,11 @@
 #include "app.h"
 #include "global.h"
 
+// Monitor shutdown is asynchronous; poll for admitted rule work before teardown.
+VOID _app_monitor_stop ();
+BOOLEAN _app_monitor_isbusy ();
+BOOLEAN _app_monitor_isrunning ();
+
 // libs
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -213,8 +218,6 @@ typedef struct _STATIC_DATA
 	HBITMAP hbmp_disable;
 	HBITMAP hbmp_allow;
 	HBITMAP hbmp_block;
-
-	HANDLE hmonitor_thread;
 
 	HANDLE hnotify_evt;
 

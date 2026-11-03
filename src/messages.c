@@ -3,6 +3,9 @@
 
 #include "global.h"
 
+// Caller holds lock_autoallow; defined with application profile operations.
+BOOLEAN _app_revokeappassociations (HANDLE engine_handle, PITEM_APP ptr_app, PR_LIST affected_rules, BOOLEAN include_manual);
+
 VOID _app_message_initialize (
 	_In_ HWND hwnd
 )
@@ -1889,6 +1892,8 @@ VOID _app_command_idtotimers (
 	LONG64 seconds;
 	INT listview_id;
 	INT item_id = INT_ERROR;
+	BOOLEAN is_failed = FALSE;
+	BOOLEAN item_failed;
 
 	listview_id = _app_listview_getcontext (hwnd, INT_ERROR)->listview_id;
 
@@ -1911,13 +1916,27 @@ VOID _app_command_idtotimers (
 
 			if (ptr_app)
 			{
-				_app_timer_set (hwnd, ptr_app, seconds);
+				_r_queuedlock_acquireexclusive (&lock_autoallow);
+				_app_timer_set (NULL, ptr_app, seconds);
+				item_failed = !ptr_app->htimer;
+				_r_queuedlock_releaseexclusive (&lock_autoallow);
 
-				_r_obj_addlistitem (rules, ptr_app);
+				_app_listview_updateitemby_param (hwnd, ptr_app->app_hash, TRUE);
+
+				if (item_failed)
+				{
+					is_failed = TRUE;
+					_r_obj_dereference (ptr_app);
+				}
+				else
+				{
+					_r_obj_addlistitem (rules, ptr_app);
+				}
 			}
 		}
 
-		_wfp_createappfilters (hengine, rules, TEXT (__FILE__), __LINE__, FALSE);
+		if (!_r_obj_isempty2 (rules) && !_wfp_createappfilters (hengine, rules, TEXT (__FILE__), __LINE__, FALSE))
+			is_failed = TRUE;
 
 		_r_obj_dereference (rules);
 	}
@@ -1925,6 +1944,9 @@ VOID _app_command_idtotimers (
 	_app_listview_updateby_id (hwnd, listview_id, PR_UPDATE_FORCE);
 
 	_app_profile_save (hwnd);
+
+	if (is_failed)
+		_wfp_warnruleupdate (hwnd);
 }
 
 VOID _app_command_logshow (
@@ -2163,10 +2185,11 @@ VOID _app_command_checkbox (
 	INT item_id = INT_ERROR;
 	BOOLEAN new_val = (ctrl_id == IDM_CHECK);
 	BOOLEAN is_changed = FALSE;
-	BOOLEAN is_item_changed;
-	BOOLEAN is_rebuild_failed = FALSE;
+	BOOLEAN is_failed = FALSE;
+	BOOLEAN item_failed;
+	BOOLEAN old_enabled;
+	BOOLEAN old_auto_blocked;
 
-	rules = _r_obj_createlist (8, &_r_obj_dereference);
 	listview_id = _app_listview_getcontext (hwnd, INT_ERROR)->listview_id;
 
 	if (listview_id >= IDC_APPS_PROFILE && listview_id <= IDC_APPS_UWP)
@@ -2179,54 +2202,65 @@ VOID _app_command_checkbox (
 			if (!ptr_app)
 				continue;
 
+			rules = _r_obj_createlist (4, &_r_obj_dereference);
+			hengine = new_val ? NULL : _wfp_getenginehandle ();
+			item_failed = FALSE;
 			_r_queuedlock_acquireexclusive (&lock_autoallow);
-			is_item_changed = (ptr_app->is_enabled != new_val || ptr_app->is_autoallow_blocked == new_val);
+			old_enabled = !!ptr_app->is_enabled;
+			old_auto_blocked = !!ptr_app->is_autoallow_blocked;
 
-			if (is_item_changed)
+			if (old_enabled != new_val || old_auto_blocked == new_val)
 			{
-				ptr_app->is_autoallow_blocked = !new_val;
+				if (!new_val && !_app_revokeappassociations (hengine, ptr_app, rules, FALSE))
+				{
+					item_failed = TRUE;
+				}
+				else
+				{
+					ptr_app->is_autoallow_blocked = !new_val;
 
-				if (!new_val)
-					_app_timer_reset (NULL, ptr_app);
+					if (!new_val)
+						_app_timer_reset (NULL, ptr_app);
 
-				ptr_app->is_enabled = new_val;
+					ptr_app->is_enabled = new_val;
+					is_changed = TRUE;
+				}
 			}
 
 			_r_queuedlock_releaseexclusive (&lock_autoallow);
 
-			if (is_item_changed)
+			if (!item_failed && new_val && (old_enabled != new_val || old_auto_blocked == new_val) && _wfp_isfiltersinstalled ())
 			{
-				if (new_val)
-					_app_notify_freeobject (NULL, ptr_app);
+				_r_obj_addlistitem (rules, _r_obj_reference (ptr_app));
+				item_failed = !_wfp_createappfilters (_wfp_getenginehandle (), rules, DBG_ARG, FALSE);
 
-				_app_listview_lock (hwnd, listview_id, TRUE);
-				_app_setappiteminfo (hwnd, listview_id, item_id, ptr_app);
-				_app_listview_lock (hwnd, listview_id, FALSE);
-
-				_r_obj_addlistitem (rules, ptr_app);
-
-				is_changed = TRUE;
-
-				// do not reset reference counter
+				if (item_failed)
+				{
+					_r_queuedlock_acquireexclusive (&lock_autoallow);
+					ptr_app->is_enabled = old_enabled;
+					ptr_app->is_autoallow_blocked = old_auto_blocked;
+					_r_queuedlock_releaseexclusive (&lock_autoallow);
+				}
 			}
-			else
+			else if (!item_failed && !new_val && !_r_obj_isempty2 (rules) && _wfp_isfiltersinstalled ())
 			{
-				_r_obj_dereference (ptr_app);
+				item_failed = !_wfp_createrulefilters (_wfp_getenginehandle (), rules, DBG_ARG, FALSE);
 			}
+
+			if (item_failed)
+				is_failed = TRUE;
+			else if (new_val && (old_enabled != new_val || old_auto_blocked == new_val))
+			{
+				_app_notify_freeobject (NULL, ptr_app);
+				_app_autoallow_refresh (hwnd);
+			}
+
+			_app_listview_lock (hwnd, listview_id, TRUE);
+			_app_setappiteminfo (hwnd, listview_id, item_id, ptr_app);
+			_app_listview_lock (hwnd, listview_id, FALSE);
+			_r_obj_dereference (rules);
+			_r_obj_dereference (ptr_app);
 		}
-
-		if (is_changed)
-		{
-			if (_wfp_isfiltersinstalled ())
-			{
-				hengine = _wfp_getenginehandle ();
-
-				is_rebuild_failed = !_wfp_createappfilters (hengine, rules, DBG_ARG, FALSE);
-			}
-		}
-
-		if (is_changed && !is_rebuild_failed)
-			_app_autoallow_refresh (hwnd);
 	}
 	else if (listview_id >= IDC_RULES_BLOCKLIST && listview_id <= IDC_RULES_CUSTOM)
 	{
@@ -2238,64 +2272,66 @@ VOID _app_command_checkbox (
 			if (!ptr_rule)
 				continue;
 
+			hengine = new_val ? NULL : _wfp_getenginehandle ();
+			item_failed = FALSE;
 			_r_queuedlock_acquireexclusive (&lock_autoallow);
-			is_item_changed = (ptr_rule->is_enabled != new_val);
+			old_enabled = !!ptr_rule->is_enabled;
 
-			if (is_item_changed)
-				_app_ruleenable (ptr_rule, new_val, TRUE);
+			if (old_enabled != new_val)
+			{
+				if (!new_val && !_wfp_destroyfilters_array_silent (hengine, ptr_rule->guids, DBG_ARG))
+				{
+					ptr_rule->is_haveerrors = TRUE;
+					item_failed = TRUE;
+				}
+				else
+				{
+					_app_ruleenable (ptr_rule, new_val, TRUE);
+					item_failed = (ptr_rule->is_enabled != new_val);
+					is_changed = TRUE;
+				}
+			}
 
 			_r_queuedlock_releaseexclusive (&lock_autoallow);
 
-			if (is_item_changed)
+			if (!item_failed && new_val && old_enabled != new_val && _wfp_isfiltersinstalled ())
 			{
-				_app_listview_lock (hwnd, listview_id, TRUE);
-				_app_setruleiteminfo (hwnd, listview_id, item_id, ptr_rule, TRUE);
-				_app_listview_lock (hwnd, listview_id, FALSE);
-
+				rules = _r_obj_createlist (1, NULL);
 				_r_obj_addlistitem (rules, ptr_rule);
-
-				is_changed = TRUE;
-
-				// do not reset reference counter
+				item_failed = !_wfp_createrulefilters (_wfp_getenginehandle (), rules, DBG_ARG, FALSE);
+				_r_obj_dereference (rules);
 			}
-			else
-			{
-				_r_obj_dereference (ptr_rule);
-			}
-		}
 
-		if (is_changed)
-		{
-			if (_wfp_isfiltersinstalled ())
-			{
-				hengine = _wfp_getenginehandle ();
+			if (item_failed)
+				is_failed = TRUE;
 
-				is_rebuild_failed = !_wfp_createrulefilters (hengine, rules, DBG_ARG, FALSE);
-			}
+			_app_listview_lock (hwnd, listview_id, TRUE);
+			_app_setruleiteminfo (hwnd, listview_id, item_id, ptr_rule, TRUE);
+			_app_listview_lock (hwnd, listview_id, FALSE);
+			_r_obj_dereference (ptr_rule);
 		}
 	}
-
-	_r_obj_dereference (rules);
 
 	if (is_changed)
 	{
 		_app_listview_updateby_id (hwnd, listview_id, PR_UPDATE_FORCE);
-
 		_app_profile_save (hwnd);
 	}
 
-	if (is_rebuild_failed)
-		_r_show_message (hwnd, MB_OK | MB_ICONERROR, NULL, L"Could not update the filters. Previous filters may still be active. Review the affected items and retry.");
+	if (is_failed)
+		_wfp_warnruleupdate (hwnd);
 }
 
 VOID _app_command_delete (
 	_In_ HWND hwnd
 )
 {
+	HANDLE hengine;
 	R_STRINGREF crlf = PR_STRINGREF_INIT (SZ_CRLF);
 	R_STRINGBUILDER sb;
 	PITEM_NETWORK ptr_network;
 	PR_HASHTABLE apps_checker;
+	PR_LIST affected_rules;
 	MIB_TCPROW tcprow;
 	PR_STRING string;
 	PITEM_APP ptr_app;
@@ -2308,6 +2344,7 @@ VOID _app_command_delete (
 	INT listview_id;
 	INT item_count;
 	BOOLEAN is_revoke_failed = FALSE;
+	BOOLEAN is_rebuild_failed = FALSE;
 
 	listview_id = _app_listview_getcontext (hwnd, INT_ERROR)->listview_id;
 
@@ -2374,8 +2411,6 @@ VOID _app_command_delete (
 		_r_obj_dereference (string);
 	}
 
-	_r_queuedlock_acquireexclusive (&lock_autoallow);
-
 	for (INT i = item_count - 1; i != INT_ERROR; i--)
 	{
 		if (!_r_listview_isitemselected (hwnd, listview_id, i))
@@ -2391,23 +2426,34 @@ VOID _app_command_delete (
 
 			if (!ptr_app->is_undeletable) // skip "undeletable" apps
 			{
-				if (!_wfp_destroyfilters_array (_wfp_getenginehandle (), ptr_app->guids, DBG_ARG))
+				affected_rules = _r_obj_createlist (4, &_r_obj_dereference);
+				hengine = _wfp_getenginehandle ();
+				_r_queuedlock_acquireexclusive (&lock_autoallow);
+
+				if (!_app_revokeappassociations (hengine, ptr_app, affected_rules, TRUE))
 				{
+					_r_queuedlock_releaseexclusive (&lock_autoallow);
 					is_revoke_failed = TRUE;
-					ptr_app->is_haveerrors = TRUE;
 					_app_listview_updateitemby_param (hwnd, hash_code, TRUE);
+					_r_obj_dereference (affected_rules);
 					_r_obj_dereference (ptr_app);
 					continue;
 				}
 
 				_r_listview_deleteitem (hwnd, listview_id, i);
-
 				_app_timer_reset (hwnd, ptr_app);
 				_app_notify_freeobject (NULL, ptr_app);
 
 				_r_queuedlock_acquireexclusive (&lock_apps);
 				_app_freeapplication (hwnd, hash_code);
 				_r_queuedlock_releaseexclusive (&lock_apps);
+				_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+				if (!_r_obj_isempty2 (affected_rules) && _wfp_isfiltersinstalled () &&
+					!_wfp_createrulefilters (_wfp_getenginehandle (), affected_rules, DBG_ARG, FALSE))
+					is_rebuild_failed = TRUE;
+
+				_r_obj_dereference (affected_rules);
 			}
 
 			_r_obj_dereference (ptr_app);
@@ -2422,10 +2468,14 @@ VOID _app_command_delete (
 
 			if (!ptr_rule->is_readonly) // skip "read-only" rules
 			{
+				hengine = _wfp_getenginehandle ();
+				_r_queuedlock_acquireexclusive (&lock_autoallow);
+
 				// Revoke while the rule still owns its IDs and remains visible.
 				// A Windows failure must not orphan an automatic permit.
-				if (!_wfp_destroyfilters_array (_wfp_getenginehandle (), ptr_rule->guids, DBG_ARG))
+				if (!_wfp_destroyfilters_array_silent (hengine, ptr_rule->guids, DBG_ARG))
 				{
+					_r_queuedlock_releaseexclusive (&lock_autoallow);
 					is_revoke_failed = TRUE;
 					ptr_rule->is_haveerrors = TRUE;
 					_app_listview_updateitemby_param (hwnd, rule_idx, FALSE);
@@ -2455,6 +2505,7 @@ VOID _app_command_delete (
 				_r_queuedlock_acquireexclusive (&lock_rules);
 				_r_obj_setlistitem (rules_list, rule_idx, NULL);
 				_r_queuedlock_releaseexclusive (&lock_rules);
+				_r_queuedlock_releaseexclusive (&lock_autoallow);
 
 				enum_key = 0;
 
@@ -2498,14 +2549,15 @@ VOID _app_command_delete (
 		}
 	}
 
-	_r_queuedlock_releaseexclusive (&lock_autoallow);
-
-	if (!is_revoke_failed && listview_id != IDC_NETWORK)
+	if (listview_id != IDC_NETWORK)
 		_app_autoallow_refresh (hwnd);
 
 	_app_listview_updateby_id (hwnd, listview_id, 0);
 
 	_app_profile_save (hwnd);
+
+	if (is_rebuild_failed)
+		_wfp_warnruleupdate (hwnd);
 
 	if (is_revoke_failed)
 		_r_show_message (hwnd, MB_OK | MB_ICONERROR, NULL, L"Some items could not be deleted because their filters could not be removed. Those items and their existing filters were kept. Retry the deletion.");
@@ -2516,11 +2568,13 @@ VOID _app_command_disable (
 	_In_ INT ctrl_id
 )
 {
+	HANDLE hengine;
 	PITEM_APP ptr_app;
 	ULONG_PTR app_hash;
 	INT listview_id;
 	INT item_id = INT_ERROR;
 	BOOL new_val = INT_ERROR;
+	BOOLEAN is_revoke_failed = FALSE;
 
 	listview_id = _app_listview_getcontext (hwnd, INT_ERROR)->listview_id;
 
@@ -2556,7 +2610,18 @@ VOID _app_command_disable (
 		}
 		else if (ctrl_id == IDM_DISABLETIMER)
 		{
-			_app_timer_reset (hwnd, ptr_app);
+			hengine = _wfp_getenginehandle ();
+			_r_queuedlock_acquireexclusive (&lock_autoallow);
+
+			if (_wfp_destroyfilters_array_silent (hengine, ptr_app->guids, DBG_ARG))
+				_app_timer_reset (NULL, ptr_app);
+			else
+			{
+				ptr_app->is_haveerrors = TRUE;
+				is_revoke_failed = TRUE;
+			}
+
+			_r_queuedlock_releaseexclusive (&lock_autoallow);
 		}
 
 		_app_listview_updateitemby_id (hwnd, listview_id, item_id);
@@ -2567,6 +2632,9 @@ VOID _app_command_disable (
 	_app_listview_updateby_id (hwnd, listview_id, 0);
 
 	_app_profile_save (hwnd);
+
+	if (is_revoke_failed)
+		_wfp_warnruleupdate (hwnd);
 }
 
 VOID _app_command_openeditor (
@@ -2872,13 +2940,16 @@ VOID _app_command_purgeunused (
 	_In_ HWND hwnd
 )
 {
+	HANDLE hengine;
 	R_STRINGBUILDER sb;
 	PITEM_APP ptr_app = NULL;
 	PR_STRING string = NULL;
 	PR_HASHTABLE apps_list;
+	PR_LIST affected_rules;
 	ULONG_PTR enum_key = 0;
 	ULONG_PTR hash_code;
 	BOOLEAN is_revoke_failed = FALSE;
+	BOOLEAN is_rebuild_failed = FALSE;
 
 	apps_list = _r_obj_createhashtable (sizeof (ULONG_PTR), 8, NULL);
 
@@ -2918,8 +2989,6 @@ VOID _app_command_purgeunused (
 
 		if (_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_PURGE_UNUSED), string->buffer, L"ConfirmUnused", FALSE))
 		{
-			_r_queuedlock_acquireexclusive (&lock_autoallow);
-
 			while (_r_obj_enumhashtable (apps_list, NULL, &hash_code, &enum_key))
 			{
 				ptr_app = _app_getappitem (hash_code);
@@ -2927,10 +2996,15 @@ VOID _app_command_purgeunused (
 				if (!ptr_app)
 					continue;
 
-				if (!_wfp_destroyfilters_array (_wfp_getenginehandle (), ptr_app->guids, DBG_ARG))
+				affected_rules = _r_obj_createlist (4, &_r_obj_dereference);
+				hengine = _wfp_getenginehandle ();
+				_r_queuedlock_acquireexclusive (&lock_autoallow);
+
+				if (!_app_revokeappassociations (hengine, ptr_app, affected_rules, TRUE))
 				{
+					_r_queuedlock_releaseexclusive (&lock_autoallow);
 					is_revoke_failed = TRUE;
-					ptr_app->is_haveerrors = TRUE;
+					_r_obj_dereference (affected_rules);
 					_r_obj_dereference (ptr_app);
 					continue;
 				}
@@ -2942,13 +3016,17 @@ VOID _app_command_purgeunused (
 				_r_queuedlock_acquireexclusive (&lock_apps);
 				_app_freeapplication (hwnd, hash_code);
 				_r_queuedlock_releaseexclusive (&lock_apps);
+				_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+				if (!_r_obj_isempty2 (affected_rules) && _wfp_isfiltersinstalled () &&
+					!_wfp_createrulefilters (_wfp_getenginehandle (), affected_rules, DBG_ARG, FALSE))
+					is_rebuild_failed = TRUE;
+
+				_r_obj_dereference (affected_rules);
 				_r_obj_dereference (ptr_app);
 			}
 
-			_r_queuedlock_releaseexclusive (&lock_autoallow);
-
-			if (!is_revoke_failed)
-				_app_autoallow_refresh (hwnd);
+			_app_autoallow_refresh (hwnd);
 
 			_app_listview_updateby_id (hwnd, DATA_LISTVIEW_CURRENT, PR_UPDATE_TYPE | PR_UPDATE_FORCE);
 
@@ -2960,6 +3038,9 @@ VOID _app_command_purgeunused (
 
 	_r_obj_dereference (apps_list);
 
+	if (is_rebuild_failed)
+		_wfp_warnruleupdate (hwnd);
+
 	if (is_revoke_failed)
 		_r_show_message (hwnd, MB_OK | MB_ICONERROR, NULL, L"Some applications could not be removed because their filters could not be removed. Those applications and their existing filters were kept. Retry the cleanup.");
 }
@@ -2968,18 +3049,19 @@ VOID _app_command_purgetimers (
 	_In_ HWND hwnd
 )
 {
+	HANDLE hengine;
 	PITEM_APP ptr_app = NULL;
 	R_STRINGBUILDER sb;
 	PR_STRING string;
 	PR_STRING path;
-	HANDLE hengine;
 	PR_LIST rules;
 	ULONG_PTR enum_key = 0;
+	BOOLEAN is_revoke_failed = FALSE;
 
 	if (!_app_istimersactive ())
 		return;
 
-	rules = _r_obj_createlist (10, NULL);
+	rules = _r_obj_createlist (10, &_r_obj_dereference);
 
 	_r_obj_initializestringbuilder (&sb, 256);
 
@@ -2989,7 +3071,7 @@ VOID _app_command_purgetimers (
 	{
 		if (_app_istimerset (ptr_app))
 		{
-			_r_obj_addlistitem (rules, ptr_app);
+			_r_obj_addlistitem (rules, _r_obj_reference (ptr_app));
 
 			path = _app_getappdisplayname (ptr_app, FALSE);
 
@@ -3027,19 +3109,30 @@ VOID _app_command_purgetimers (
 
 		if (_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_QUESTION_TIMERS), string->buffer, L"ConfirmTimers", FALSE))
 		{
-			if (_wfp_isfiltersinstalled ())
-			{
-				hengine = _wfp_getenginehandle ();
-
-				_wfp_createappfilters (hengine, rules, DBG_ARG, FALSE);
-			}
+			hengine = _wfp_getenginehandle ();
 
 			for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules); i++)
 			{
 				ptr_app = _r_obj_getlistitem (rules, i);
 
-				if (ptr_app)
-					_app_timer_reset (hwnd, ptr_app);
+				if (!ptr_app)
+					continue;
+
+				_r_queuedlock_acquireexclusive (&lock_autoallow);
+
+				if (_app_istimerset (ptr_app))
+				{
+					if (_wfp_destroyfilters_array_silent (hengine, ptr_app->guids, DBG_ARG))
+						_app_timer_reset (NULL, ptr_app);
+					else
+					{
+						ptr_app->is_haveerrors = TRUE;
+						is_revoke_failed = TRUE;
+					}
+				}
+
+				_r_queuedlock_releaseexclusive (&lock_autoallow);
+				_app_listview_updateitemby_param (hwnd, ptr_app->app_hash, TRUE);
 			}
 
 			_app_listview_updateby_id (hwnd, DATA_LISTVIEW_CURRENT, PR_UPDATE_TYPE | PR_UPDATE_FORCE);
@@ -3051,6 +3144,9 @@ VOID _app_command_purgetimers (
 	_r_obj_deletestringbuilder (&sb);
 
 	_r_obj_dereference (rules);
+
+	if (is_revoke_failed)
+		_wfp_warnruleupdate (hwnd);
 }
 
 VOID _app_command_selectfont (

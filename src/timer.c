@@ -29,10 +29,8 @@ BOOLEAN _app_istimerset (
 	_In_ PITEM_APP ptr_app
 )
 {
-	if (!ptr_app->htimer)
-		return FALSE;
-
-	return !!IsThreadpoolTimerSet (ptr_app->htimer);
+	// A deadline remains pending even if its timer fired or allocation failed.
+	return ptr_app->timer != 0 || (ptr_app->htimer && !!IsThreadpoolTimerSet (ptr_app->htimer));
 }
 
 VOID _app_timer_set (
@@ -87,7 +85,7 @@ VOID _app_timer_set (
 		}
 		else
 		{
-			_app_timer_reset (NULL, ptr_app);
+			ptr_app->is_haveerrors = TRUE;
 		}
 	}
 
@@ -105,7 +103,7 @@ VOID _app_timer_reset (
 
 	ptr_app->timer = 0;
 
-	if (_app_istimerset (ptr_app))
+	if (ptr_app->htimer)
 		_app_timer_remove (ptr_app);
 
 	if (hwnd)
@@ -135,40 +133,62 @@ VOID CALLBACK _app_timer_callback (
 	HANDLE hengine;
 	HWND hwnd;
 	PITEM_APP ptr_app;
-	PR_LIST rules;
 	PR_STRING string;
+	LARGE_INTEGER retry_time;
 	WCHAR buffer[256];
 	ULONG icon_id;
 	HRESULT status;
+	BOOLEAN is_revoke_failed;
 
-	ptr_app = _app_getappitem ((ULONG_PTR)context);
-
-	if (!ptr_app)
-		return;
-
+	UNREFERENCED_PARAMETER (instance);
 	status = CoInitializeEx (NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-
 	hwnd = _r_app_gethwnd ();
-
-	_app_timer_reset (hwnd, ptr_app);
-
 	hengine = _wfp_getenginehandle ();
 
-	rules = _r_obj_createlist (2, NULL);
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
+	ptr_app = _app_getappitem ((ULONG_PTR)context);
 
-	_r_obj_addlistitem (rules, ptr_app);
+	// A queued callback can outlive a reset, replacement, or deletion.
+	if (!ptr_app || ptr_app->htimer != timer || !ptr_app->timer || ptr_app->timer > _r_unixtime_now ())
+	{
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
 
-	_wfp_createappfilters (hengine, rules, DBG_ARG, FALSE);
+		if (ptr_app)
+			_r_obj_dereference (ptr_app);
 
-	_r_obj_dereference (rules);
+		if (status == S_OK || status == S_FALSE)
+			CoUninitialize ();
 
+		return;
+	}
+
+	is_revoke_failed = !_wfp_destroyfilters_array_silent (hengine, ptr_app->guids, DBG_ARG);
+
+	if (is_revoke_failed)
+	{
+		ptr_app->is_haveerrors = TRUE;
+		retry_time.QuadPart = -300000000LL; // 30 seconds, relative to now
+		TpSetTimer (timer, &retry_time, 0, 0);
+	}
+	else
+	{
+		_app_timer_reset (NULL, ptr_app);
+
+		if (ptr_app->htimer == timer)
+			_app_timer_remove (ptr_app);
+	}
+
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+	_app_listview_updateitemby_param (hwnd, ptr_app->app_hash, TRUE);
 	_app_listview_updateby_id (hwnd, ptr_app->type, PR_UPDATE_TYPE | PR_UPDATE_FORCE);
-
-	_r_obj_dereference (ptr_app);
-
 	_app_profile_save (hwnd);
 
-	if (_r_config_getboolean (L"IsNotificationsTimer", TRUE))
+	if (is_revoke_failed)
+	{
+		_wfp_warnruleupdate (hwnd);
+	}
+	else if (_r_config_getboolean (L"IsNotificationsTimer", TRUE))
 	{
 		icon_id = NIIF_INFO;
 
@@ -190,6 +210,8 @@ VOID CALLBACK _app_timer_callback (
 		if (string)
 			_r_obj_dereference (string);
 	}
+
+	_r_obj_dereference (ptr_app);
 
 	if (status == S_OK || status == S_FALSE)
 		CoUninitialize ();

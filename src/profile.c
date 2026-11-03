@@ -68,10 +68,12 @@ BOOLEAN _app_getappinfo (
 			if (length != sizeof (PVOID))
 				return FALSE;
 
-			if (ptr_app->hash)
-			{
-				ptr = _r_obj_reference (ptr_app->hash);
+			_r_queuedlock_acquireshared (&lock_apps);
+			ptr = _r_obj_referencesafe (ptr_app->hash);
+			_r_queuedlock_releaseshared (&lock_apps);
 
+			if (ptr)
+			{
 				RtlCopyMemory (buffer, &ptr, length);
 
 				return TRUE;
@@ -185,16 +187,16 @@ BOOLEAN _app_getappinfobyhash (
 	return is_success;
 }
 
-// The WFP helper retains filter IDs when revocation fails.
+// Caller holds lock_autoallow; the WFP helper retains IDs on failure.
 static BOOLEAN _app_revokeappfilters (
-	_Inout_ PITEM_APP ptr_app
+	_Inout_ PITEM_APP ptr_app,
+	_In_ HANDLE engine_handle
 )
 {
-	if (_wfp_destroyfilters_array (_wfp_getenginehandle (), ptr_app->guids, DBG_ARG))
+	if (_wfp_destroyfilters_array_silent (engine_handle, ptr_app->guids, DBG_ARG))
 		return TRUE;
 
 	ptr_app->is_haveerrors = TRUE;
-	_r_show_message (_r_app_gethwnd (), MB_OK | MB_ICONERROR, NULL, L"Could not remove the application filters. Previous permissions may still be active. Retry the change or reapply filters.");
 	return FALSE;
 }
 
@@ -220,7 +222,9 @@ VOID _app_setappinfo (
 
 		case INFO_HASH:
 		{
+			_r_queuedlock_acquireexclusive (&lock_apps);
 			_r_obj_movereference (&ptr_app->hash, value);
+			_r_queuedlock_releaseexclusive (&lock_apps);
 			break;
 		}
 
@@ -236,20 +240,34 @@ VOID _app_setappinfo (
 
 		case INFO_TIMER:
 		{
+			HANDLE engine_handle = NULL;
 			LONG64 timestamp;
+			BOOLEAN is_expired;
+			BOOLEAN is_success = TRUE;
 
 			if (!value)
 				break;
 
 			timestamp = *((PLONG64)value);
+			is_expired = (timestamp <= _r_unixtime_now ());
 
-			// check timer expiration
-			if (timestamp <= _r_unixtime_now ())
+			if (is_expired)
+				engine_handle = _wfp_getenginehandle ();
+
+			_r_queuedlock_acquireexclusive (&lock_autoallow);
+
+			if (is_expired)
 			{
-				if (_app_revokeappfilters (ptr_app))
+				is_success = _app_revokeappfilters (ptr_app, engine_handle);
+
+				if (is_success)
 				{
 					ptr_app->timer = 0;
 					ptr_app->is_enabled = FALSE;
+				}
+				else if (!ptr_app->timer)
+				{
+					ptr_app->timer = timestamp;
 				}
 			}
 			else
@@ -258,6 +276,11 @@ VOID _app_setappinfo (
 				ptr_app->is_enabled = TRUE;
 			}
 
+			_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+			if (!is_success)
+				_wfp_warnruleupdate (_r_app_gethwnd ());
+
 			_app_listview_updateitemby_param (_r_app_gethwnd (), ptr_app->app_hash, TRUE);
 
 			break;
@@ -265,8 +288,19 @@ VOID _app_setappinfo (
 
 		case INFO_DISABLE:
 		{
-			if (_app_revokeappfilters (ptr_app))
+			HANDLE engine_handle = _wfp_getenginehandle ();
+			BOOLEAN is_success;
+
+			_r_queuedlock_acquireexclusive (&lock_autoallow);
+			is_success = _app_revokeappfilters (ptr_app, engine_handle);
+
+			if (is_success)
 				ptr_app->is_enabled = FALSE;
+
+			_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+			if (!is_success)
+				_wfp_warnruleupdate (_r_app_gethwnd ());
 
 			_app_listview_updateitemby_param (_r_app_gethwnd (), ptr_app->app_hash, TRUE);
 
@@ -836,6 +870,75 @@ VOID _app_freeapplication (
 
 	// Caller holds lock_apps while removing the application.
 	_r_obj_removehashtableitem (apps_table, app_hash);
+}
+
+// Caller holds lock_autoallow. Revoking permits before changing membership keeps
+// deleted or excluded apps from retaining an old rule permit on rebuild failure.
+BOOLEAN _app_revokeappassociations (
+	_In_ HANDLE engine_handle,
+	_In_ PITEM_APP ptr_app,
+	_In_ PR_LIST affected_rules,
+	_In_ BOOLEAN include_manual
+)
+{
+	PR_ARRAY guids;
+	PITEM_RULE ptr_rule;
+	BOOLEAN is_member;
+	BOOLEAN is_success;
+
+	guids = _r_obj_createarray (sizeof (GUID), 10, NULL);
+
+	if (!_r_obj_isempty (ptr_app->guids))
+		_r_obj_addarrayitems (guids, ptr_app->guids->items, ptr_app->guids->count);
+
+	_r_queuedlock_acquireshared (&lock_rules);
+
+	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules_list); i++)
+	{
+		ptr_rule = _r_obj_getlistitem (rules_list, i);
+
+		if (!ptr_rule || ptr_rule->type != DATA_RULE_USER)
+			continue;
+
+		is_member = include_manual && _r_obj_findhashtable (ptr_rule->apps, ptr_app->app_hash);
+
+		_r_queuedlock_acquireshared (&lock_autoapps);
+		is_member = is_member || _r_obj_findhashtable (ptr_rule->auto_apps, ptr_app->app_hash);
+		_r_queuedlock_releaseshared (&lock_autoapps);
+
+		if (!is_member)
+			continue;
+
+		_r_obj_addlistitem (affected_rules, _r_obj_reference (ptr_rule));
+
+		// Keep block filters in place until their replacement transaction commits.
+		if (ptr_rule->action == FWP_ACTION_PERMIT && !_r_obj_isempty (ptr_rule->guids))
+			_r_obj_addarrayitems (guids, ptr_rule->guids->items, ptr_rule->guids->count);
+	}
+
+	_r_queuedlock_releaseshared (&lock_rules);
+
+	is_success = _wfp_destroyfilters_array_silent (engine_handle, guids, DBG_ARG);
+
+	if (is_success)
+	{
+		_r_obj_cleararray (ptr_app->guids);
+
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (affected_rules); i++)
+		{
+			ptr_rule = _r_obj_getlistitem (affected_rules, i);
+
+			if (ptr_rule->action == FWP_ACTION_PERMIT)
+				_r_obj_cleararray (ptr_rule->guids);
+		}
+	}
+	else
+	{
+		ptr_app->is_haveerrors = TRUE;
+	}
+
+	_r_obj_dereference (guids);
+	return is_success;
 }
 
 VOID _app_getcount (

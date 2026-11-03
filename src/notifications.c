@@ -3,6 +3,9 @@
 
 #include "global.h"
 
+// Caller holds lock_autoallow; defined with application profile operations.
+BOOLEAN _app_revokeappassociations (HANDLE engine_handle, PITEM_APP ptr_app, PR_LIST affected_rules, BOOLEAN include_manual);
+
 _Ret_maybenull_
 HWND _app_notify_getwindow (
 	_In_opt_ PITEM_LOG ptr_log
@@ -70,9 +73,19 @@ BOOLEAN _app_notify_command (
 )
 {
 	PITEM_APP ptr_app;
+	PITEM_APP current_app;
 	PR_LIST rules;
-	HANDLE hengine;
+	PR_LIST affected_rules;
+	HANDLE hengine = NULL;
 	ULONG_PTR app_hash;
+	LONG64 old_timer = 0;
+	PTP_TIMER old_htimer = NULL;
+	BOOLEAN old_enabled = FALSE;
+	BOOLEAN old_blocked = FALSE;
+	BOOLEAN old_silent = FALSE;
+	BOOLEAN is_failed = FALSE;
+	BOOLEAN is_revoked = FALSE;
+	BOOLEAN is_restored = FALSE;
 
 	app_hash = _app_notify_getapp_id (hwnd);
 	ptr_app = _app_getappitem (app_hash);
@@ -80,61 +93,123 @@ BOOLEAN _app_notify_command (
 	if (!ptr_app)
 		return FALSE;
 
-	_app_notify_freeobject (hwnd, ptr_app);
-
 	rules = _r_obj_createlist (4, NULL);
+	affected_rules = _r_obj_createlist (4, &_r_obj_dereference);
 
 	if (button_id == IDC_ALLOW_BTN || button_id == IDC_BLOCK_BTN)
 	{
-		_r_queuedlock_acquireexclusive (&lock_autoallow);
-		ptr_app->is_enabled = (button_id == IDC_ALLOW_BTN);
-		ptr_app->is_autoallow_blocked = (button_id == IDC_BLOCK_BTN);
-		_r_queuedlock_releaseexclusive (&lock_autoallow);
-		ptr_app->is_silent = (button_id == IDC_BLOCK_BTN);
+		if (button_id == IDC_BLOCK_BTN)
+			hengine = _wfp_getenginehandle ();
 
-		if (ptr_app->is_enabled && seconds)
+		_r_queuedlock_acquireexclusive (&lock_autoallow);
+		old_enabled = !!ptr_app->is_enabled;
+		old_blocked = !!ptr_app->is_autoallow_blocked;
+		old_silent = !!ptr_app->is_silent;
+		old_timer = ptr_app->timer;
+		old_htimer = ptr_app->htimer;
+		current_app = _app_getappitem (app_hash);
+
+		if (current_app != ptr_app || (button_id == IDC_BLOCK_BTN && !_app_revokeappassociations (hengine, ptr_app, affected_rules, FALSE)))
 		{
-			_app_timer_set (_r_app_gethwnd (), ptr_app, seconds);
+			is_failed = TRUE;
 		}
 		else
 		{
-			_app_listview_updateitemby_param (_r_app_gethwnd (), app_hash, TRUE);
+			is_revoked = (button_id == IDC_BLOCK_BTN);
+			ptr_app->is_enabled = (button_id == IDC_ALLOW_BTN);
+			ptr_app->is_autoallow_blocked = (button_id == IDC_BLOCK_BTN);
+			ptr_app->is_silent = (button_id == IDC_BLOCK_BTN);
+
+			if (ptr_app->is_enabled && seconds)
+			{
+				_app_timer_set (NULL, ptr_app, seconds);
+
+				if (!ptr_app->htimer)
+				{
+					ptr_app->is_enabled = old_enabled;
+					ptr_app->is_autoallow_blocked = old_blocked;
+					ptr_app->is_silent = old_silent;
+					ptr_app->timer = old_timer;
+					is_failed = TRUE;
+				}
+			}
 		}
 
-		_r_obj_addlistitem (rules, ptr_app);
-	}
-	else if (button_id == IDC_NEXT_BTN)
-	{
-		// NOTHING!
+		if (current_app)
+			_r_obj_dereference (current_app);
+
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+		if (!is_failed && button_id == IDC_ALLOW_BTN && _wfp_isfiltersinstalled ())
+		{
+			hengine = _wfp_getenginehandle ();
+			_r_obj_addlistitem (rules, ptr_app);
+			is_failed = !_wfp_createappfilters (hengine, rules, DBG_ARG, FALSE);
+		}
+		else if (!is_failed && is_revoked && !_r_obj_isempty2 (affected_rules) && _wfp_isfiltersinstalled ())
+		{
+			hengine = _wfp_getenginehandle ();
+			is_failed = !_wfp_createrulefilters (hengine, affected_rules, DBG_ARG, FALSE);
+		}
+
+		if (is_failed && button_id == IDC_BLOCK_BTN && is_revoked)
+		{
+			// The permit revoke committed; restore the previous selection and
+			// attempt to recreate its filters if rebuilding the other rules failed.
+			_r_queuedlock_acquireexclusive (&lock_autoallow);
+			current_app = _app_getappitem (app_hash);
+
+			if (current_app == ptr_app && !ptr_app->is_enabled && ptr_app->is_autoallow_blocked &&
+				ptr_app->timer == old_timer && ptr_app->htimer == old_htimer)
+			{
+				ptr_app->is_enabled = old_enabled;
+				ptr_app->is_autoallow_blocked = old_blocked;
+				ptr_app->is_silent = old_silent;
+				is_restored = TRUE;
+			}
+
+			if (current_app)
+				_r_obj_dereference (current_app);
+
+			_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+			if (is_restored && old_enabled && _wfp_isfiltersinstalled ())
+			{
+				_r_obj_addlistitem (rules, ptr_app);
+				_wfp_createappfilters (_wfp_getenginehandle (), rules, DBG_ARG, FALSE);
+			}
+
+			_app_autoallow_refresh (_r_app_gethwnd ());
+		}
+		else if (!is_failed)
+		{
+			_app_autoallow_refresh (_r_app_gethwnd ());
+		}
+
+		_app_listview_updateitemby_param (_r_app_gethwnd (), app_hash, TRUE);
 	}
 	else if (button_id == IDM_DISABLENOTIFICATIONS)
 	{
 		ptr_app->is_silent = TRUE;
 	}
 
-	ptr_app->last_notify = _r_unixtime_now ();
-
-	if (rules->count)
+	if (is_failed)
 	{
-		if (_wfp_isfiltersinstalled ())
-		{
-			hengine = _wfp_getenginehandle ();
-
-			_wfp_createappfilters (hengine, rules, DBG_ARG, FALSE);
-		}
+		_wfp_warnruleupdate (_r_app_gethwnd ());
+	}
+	else
+	{
+		_app_notify_freeobject (hwnd, ptr_app);
+		ptr_app->last_notify = _r_unixtime_now ();
 	}
 
-	if (button_id == IDC_ALLOW_BTN || button_id == IDC_BLOCK_BTN)
-		_app_autoallow_refresh (_r_app_gethwnd ());
-
 	_app_listview_updateby_id (_r_app_gethwnd (), ptr_app->type, PR_UPDATE_TYPE);
-
-	_r_obj_dereference (ptr_app);
+	_r_obj_dereference (affected_rules);
 	_r_obj_dereference (rules);
-
+	_r_obj_dereference (ptr_app);
 	_app_profile_save (hwnd);
 
-	return TRUE;
+	return !is_failed;
 }
 
 BOOLEAN _app_notify_addobject (

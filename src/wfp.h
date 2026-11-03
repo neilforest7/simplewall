@@ -49,6 +49,7 @@ BOOLEAN _wfp_isfiltersinstalled ();
 
 HANDLE _wfp_getenginehandle ();
 
+// Requires at least one provider filter; this is not a full policy audit.
 ENUM_INSTALL_TYPE _wfp_getinstalltype ();
 
 PR_STRING _wfp_getlayername (
@@ -60,12 +61,13 @@ BOOLEAN _wfp_initialize (
 	_In_ HANDLE engine_handle
 );
 
-VOID _wfp_uninitialize (
+BOOLEAN _wfp_uninitialize (
 	_In_ HANDLE engine_handle,
 	_In_ BOOLEAN is_full
 );
 
-VOID _wfp_installfilters (
+// FALSE includes a rolled-back transaction or committed policy with skipped items.
+BOOLEAN _wfp_installfilters (
 	_In_ HANDLE engine_handle
 );
 
@@ -110,8 +112,16 @@ ULONG _wfp_createfilter (
 
 VOID _wfp_clearfilter_ids ();
 
-VOID _wfp_destroyfilters (
+BOOLEAN _wfp_destroyfilters (
 	_In_ HANDLE engine_handle
+);
+
+// Does not call UI; callers serialize model changes with lock_autoallow.
+BOOLEAN _wfp_destroyfilters_array_silent (
+	_In_ HANDLE engine_handle,
+	_Inout_ PR_ARRAY guids,
+	_In_ LPCWSTR file_name,
+	_In_ ULONG line
 );
 
 BOOLEAN _wfp_destroyfilters_array (

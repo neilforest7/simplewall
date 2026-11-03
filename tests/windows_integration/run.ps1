@@ -18,7 +18,6 @@ if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) { throw 'Build the 
 $runDir = Join-Path $env:RUNNER_TEMP ('simplewall-integration-' + [guid]::NewGuid().ToString('N'))
 $appDir = Join-Path $runDir 'portable'
 $inventory = Join-Path $runDir 'wfp_inventory.exe'
-$dialog = Join-Path $runDir 'uninstall_dialog.exe'
 $blockExe = Join-Path $runDir 'wfp_loopback_block.exe'
 $app = Join-Path $appDir 'simplewall.exe'
 $profile = Join-Path $appDir 'profile.xml'
@@ -155,10 +154,8 @@ function Install-Profile {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         throw 'simplewall install/rebuild timed out.'
     }
-    # The command-line path exits through application initialization. WFP state,
-    # not its process status, is the assertion of successful application.
     Write-Host "simplewall install exit code: $($process.ExitCode)"
-    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 575) {
+    if ($process.ExitCode -ne 0) {
         throw 'simplewall terminated unexpectedly during install.'
     }
     Assert-Connectivity
@@ -170,9 +167,6 @@ try {
         & cl.exe /nologo /W4 /DUNICODE /D_UNICODE /Fe:wfp_inventory.exe `
             (Join-Path $PSScriptRoot 'wfp_inventory.c') /link fwpuclnt.lib rpcrt4.lib
         if ($LASTEXITCODE -ne 0) { throw 'WFP inventory compilation failed.' }
-        & cl.exe /nologo /W4 /DUNICODE /D_UNICODE /Fe:uninstall_dialog.exe `
-            (Join-Path $PSScriptRoot 'uninstall_dialog.c') /link user32.lib
-        if ($LASTEXITCODE -ne 0) { throw 'Uninstall dialog helper compilation failed.' }
         & cl.exe /nologo /W4 /DUNICODE /D_UNICODE /Fe:wfp_loopback_block.exe `
             (Join-Path $PSScriptRoot 'wfp_loopback_block.c') /link fwpuclnt.lib rpcrt4.lib
         if ($LASTEXITCODE -ne 0) { throw 'WFP loopback helper compilation failed.' }
@@ -251,22 +245,28 @@ WF_State=false
     if ($started) {
         Write-Host 'Checking and removing temporary simplewall objects.'
         try {
-            & $inventory empty
-            $inventoryCode = $LASTEXITCODE
-            if ($inventoryCode -eq 2) {
-                $uninstall = Start-Process -FilePath $app -WorkingDirectory $appDir -PassThru `
-                    -ArgumentList '-uninstall', '-portable'
-                & $dialog $uninstall.Id
-                $dialogCode = $LASTEXITCODE
-                if (-not $uninstall.WaitForExit(20000)) {
-                    Stop-Process -Id $uninstall.Id -Force -ErrorAction SilentlyContinue
-                    throw 'Uninstall timed out.'
+            try {
+                & $inventory empty
+                $inventoryCode = $LASTEXITCODE
+                if ($inventoryCode -ne 0) {
+                    if ($inventoryCode -ne 2) {
+                        $cleanupFailed = $true
+                        Write-Warning 'Could not enumerate WFP before cleanup; attempting uninstall.'
+                    }
+                    $uninstall = Start-Process -FilePath $app -WorkingDirectory $appDir -WindowStyle Hidden -PassThru `
+                        -ArgumentList '-uninstall', '-silent', '-portable'
+                    if (-not $uninstall.WaitForExit(20000)) {
+                        Stop-Process -Id $uninstall.Id -Force -ErrorAction SilentlyContinue
+                        [void]$uninstall.WaitForExit(10000)
+                        throw 'Silent uninstall timed out.'
+                    }
+                    Write-Host "Silent uninstall exit code: $($uninstall.ExitCode)"
+                    if ($uninstall.ExitCode -ne 0) { throw 'Silent uninstall failed.' }
                 }
-                Write-Host "Uninstall dialog result=$dialogCode process exit=$($uninstall.ExitCode)"
-                if ($dialogCode -ne 0) { throw 'Uninstall dialog was not confirmed.' }
-            } elseif ($inventoryCode -ne 0) { throw 'Cannot enumerate WFP before cleanup.' }
-            & $inventory empty
-            if ($LASTEXITCODE -ne 0) { throw 'Cleanup did not remove all simplewall WFP objects.' }
+            } finally {
+                & $inventory empty
+                if ($LASTEXITCODE -ne 0) { throw 'Cleanup did not remove all simplewall WFP objects.' }
+            }
             Write-Host 'WFP cleanup confirmed.'
         } catch {
             $cleanupFailed = $true

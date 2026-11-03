@@ -3,6 +3,85 @@
 
 #include "global.h"
 
+static ULONG command_exit_code = ERROR_APP_INIT_FAILURE;
+
+#define APP_MONITOR_DRAIN_TIMER 0x4D4F4E31
+
+static BOOLEAN monitor_disabling = FALSE;
+static BOOLEAN monitor_closing = FALSE;
+static BOOLEAN monitor_timer_failed = FALSE;
+
+static VOID _app_monitor_schedule_drain (HWND hwnd)
+{
+	if (!SetTimer (hwnd, APP_MONITOR_DRAIN_TIMER, 200, NULL))
+	{
+		if (!monitor_timer_failed)
+		{
+			_r_log (LOG_LEVEL_ERROR, NULL, L"Application monitor drain timer failed", GetLastError (), NULL);
+			monitor_timer_failed = TRUE;
+			// One asynchronous retry; further window messages also retry safely.
+			PostMessageW (hwnd, WM_NULL, 0, 0);
+		}
+	}
+	else
+	{
+		monitor_timer_failed = FALSE;
+	}
+}
+
+// Run on the window thread. Never wait here: monitor jobs can send UI messages.
+static BOOLEAN _app_monitor_finish_drain (HWND hwnd)
+{
+	HMENU hmenu;
+
+	if (!monitor_disabling && !monitor_closing)
+		return FALSE;
+
+	if (_app_monitor_isbusy () ||
+		(monitor_closing && (InterlockedCompareExchange ((volatile LONG *)&file_queue.busy_count, 0, 0) ||
+			InterlockedCompareExchange ((volatile LONG *)&wfp_queue.busy_count, 0, 0) || _wfp_isfiltersapplying ())))
+	{
+		_app_monitor_schedule_drain (hwnd);
+		return FALSE;
+	}
+
+	KillTimer (hwnd, APP_MONITOR_DRAIN_TIMER);
+	if (monitor_closing)
+	{
+		DestroyWindow (hwnd);
+		return TRUE;
+	}
+
+	monitor_disabling = FALSE;
+	hmenu = GetMenu (hwnd);
+	if (hmenu)
+	{
+		_r_menu_checkitem (hmenu, IDM_USEAPPMONITOR_CHK, 0, MF_BYCOMMAND, FALSE);
+		_r_menu_enableitem (hmenu, IDM_USEAPPMONITOR_CHK, FALSE, _r_config_getboolean (L"IsHashesEnabled", FALSE));
+	}
+	return FALSE;
+}
+
+static BOOLEAN _app_monitor_start_checked (HWND hwnd)
+{
+	// Never start a new generation while work from a stopped session remains.
+	if (_app_monitor_isbusy ())
+	{
+		_app_monitor_stop ();
+		_r_config_setboolean (L"IsEnableAppMonitor", FALSE);
+		return FALSE;
+	}
+
+	_app_fileloggingenable ();
+	if (_app_monitor_isrunning ())
+		return TRUE;
+
+	_r_config_setboolean (L"IsEnableAppMonitor", FALSE);
+	_r_log (LOG_LEVEL_ERROR, &GUID_TrayIcon, L"Application monitor failed to start", 0, NULL);
+	UNREFERENCED_PARAMETER (hwnd);
+	return FALSE;
+}
+
 BOOLEAN _app_changefilters (
 	_In_ HWND hwnd,
 	_In_ BOOLEAN is_install,
@@ -11,6 +90,9 @@ BOOLEAN _app_changefilters (
 {
 	PITEM_CONTEXT context;
 	INT listview_id;
+
+	if (monitor_closing)
+		return FALSE;
 
 	listview_id = _app_listview_getcontext (hwnd, INT_ERROR)->listview_id;
 
@@ -253,6 +335,8 @@ VOID _app_config_apply (
 
 		case IDM_USEAPPMONITOR_CHK:
 		{
+			if (monitor_disabling || monitor_closing)
+				return;
 			new_val = !_r_config_getboolean (L"IsEnableAppMonitor", FALSE);
 			break;
 		}
@@ -502,12 +586,29 @@ VOID _app_config_apply (
 
 		case IDM_USEAPPMONITOR_CHK:
 		{
+			if (new_val && _app_monitor_isbusy ())
+			{
+				_app_monitor_stop ();
+				_r_config_setboolean (L"IsEnableAppMonitor", FALSE);
+				monitor_disabling = TRUE;
+				_r_menu_enableitem (hmenu, IDM_USEAPPMONITOR_CHK, FALSE, FALSE);
+				_app_monitor_finish_drain (hwnd);
+				break;
+			}
+
 			_r_config_setboolean (L"IsEnableAppMonitor", new_val);
-
-			_r_menu_checkitem (hmenu, IDM_USEAPPMONITOR_CHK, 0, MF_BYCOMMAND, new_val);
-
-			_app_fileloggingenable ();
-
+			if (new_val)
+			{
+				new_val = _app_monitor_start_checked (hwnd);
+				_r_menu_checkitem (hmenu, IDM_USEAPPMONITOR_CHK, 0, MF_BYCOMMAND, new_val);
+			}
+			else
+			{
+				_app_monitor_stop ();
+				monitor_disabling = TRUE;
+				_r_menu_enableitem (hmenu, IDM_USEAPPMONITOR_CHK, FALSE, FALSE);
+				_app_monitor_finish_drain (hwnd);
+			}
 			break;
 		}
 
@@ -2136,7 +2237,15 @@ INT_PTR CALLBACK DlgProc (
 {
 	// Retry a pending report if posting and the timer both previously failed.
 	if (msg != WM_INITDIALOG && msg != WM_DESTROY && msg != WM_NCDESTROY)
+	{
 		_wfp_schedulewarning ();
+		if ((monitor_disabling || monitor_closing) && _app_monitor_finish_drain (hwnd))
+			return TRUE;
+	}
+
+	// Once exit is confirmed, do not start new UI-driven work while draining.
+	if (monitor_closing && (msg == WM_COMMAND || msg == WM_NOTIFY || msg == WM_DROPFILES))
+		return TRUE;
 
 	switch (msg)
 	{
@@ -2175,7 +2284,7 @@ INT_PTR CALLBACK DlgProc (
 			_app_profile_load (hwnd, NULL);
 
 			// install filters
-			install_type = _wfp_isfiltersinstalled ();
+			install_type = _wfp_getinstalltype ();
 
 			if (install_type != INSTALL_DISABLED)
 			{
@@ -2208,7 +2317,8 @@ INT_PTR CALLBACK DlgProc (
 			// initialize tab
 			_app_settab_id (hwnd, _r_config_getlong (L"CurrentTab", IDC_APPS_PROFILE));
 
-			_app_fileloggingenable ();
+			if (_r_config_getboolean (L"IsEnableAppMonitor", FALSE))
+				_app_monitor_start_checked (hwnd);
 			_wfp_schedulewarning ();
 
 			break;
@@ -2329,6 +2439,11 @@ INT_PTR CALLBACK DlgProc (
 
 		case WM_TIMER:
 		{
+			if (wparam == APP_MONITOR_DRAIN_TIMER)
+			{
+				_app_monitor_finish_drain (hwnd);
+				return TRUE;
+			}
 			if (wparam == WFP_WARNING_TIMER)
 			{
 				_wfp_showwarning (hwnd);
@@ -2362,6 +2477,9 @@ INT_PTR CALLBACK DlgProc (
 			LPCWSTR cfg_name;
 			UINT locale_id;
 
+			if (monitor_closing)
+				return TRUE;
+
 			if (_wfp_isfiltersinstalled ())
 			{
 				if (_app_istimersactive ())
@@ -2383,9 +2501,10 @@ INT_PTR CALLBACK DlgProc (
 				}
 			}
 
-			DestroyWindow (hwnd);
-
-			break;
+			monitor_closing = TRUE;
+			_app_monitor_stop ();
+			_app_monitor_finish_drain (hwnd);
+			return TRUE;
 		}
 
 		case WM_DESTROY:
@@ -3878,11 +3997,13 @@ BOOLEAN NTAPI _app_parseargs (
 	_In_ R_CMDLINE_INFO_CLASS info_class
 )
 {
-	HANDLE hengine;
+	HANDLE hengine = NULL;
 
-	_app_initialize (NULL);
-
-	hengine = _wfp_getenginehandle ();
+	if (info_class != CmdlineHelp)
+	{
+		_app_initialize (NULL);
+		hengine = _wfp_getenginehandle ();
+	}
 
 	switch (info_class)
 	{
@@ -3896,14 +4017,19 @@ BOOLEAN NTAPI _app_parseargs (
 				L"simplewall.exe -install -temp - enable filtering until reboot.\r\n"
 				L"simplewall.exe -install -silent - enable filtering without prompt.\r\n"
 				L"simplewall.exe -uninstall - remove all installed filters.\r\n"
+				L"simplewall.exe -uninstall -silent - remove filters without prompt.\r\n"
 				L"simplewall.exe -help - show this message."
 			);
 
+			command_exit_code = ERROR_SUCCESS;
 			return TRUE;
 		}
 
 		case CmdlineInstall:
 		{
+			BOOLEAN is_installed = FALSE;
+
+			command_exit_code = ERROR_CANCELLED;
 			if (_r_sys_getopt (_r_sys_getcommandline (), L"silent", NULL) || _app_installmessage (NULL, TRUE))
 			{
 				if (_r_sys_getopt (_r_sys_getcommandline (), L"temp", NULL))
@@ -3913,9 +4039,10 @@ BOOLEAN NTAPI _app_parseargs (
 				_app_profile_load (NULL, NULL);
 
 				if (_wfp_initialize (NULL, hengine))
-					_wfp_installfilters (hengine);
+					is_installed = _wfp_installfilters (hengine);
 
 				_wfp_uninitialize (hengine, FALSE);
+				command_exit_code = is_installed ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
 			}
 
 			return TRUE;
@@ -3923,10 +4050,16 @@ BOOLEAN NTAPI _app_parseargs (
 
 		case CmdlineUninstall:
 		{
-			if (_wfp_isfiltersinstalled () && _app_installmessage (NULL, FALSE))
+			BOOLEAN is_uninstalled = FALSE;
+
+			command_exit_code = ERROR_CANCELLED;
+			if (_r_sys_getopt (_r_sys_getcommandline (), L"silent", NULL) ||
+				(_wfp_isfiltersinstalled () && _app_installmessage (NULL, FALSE)))
 			{
-				_wfp_destroyfilters (hengine);
-				_wfp_uninitialize (hengine, TRUE);
+				if (_wfp_destroyfilters (hengine))
+					is_uninstalled = _wfp_uninitialize (hengine, TRUE);
+
+				command_exit_code = is_uninstalled ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
 			}
 
 			return TRUE;
@@ -3947,7 +4080,7 @@ INT APIENTRY wWinMain (
 	ULONG result;
 
 	if (!_r_app_initialize (&_app_parseargs))
-		return ERROR_APP_INIT_FAILURE;
+		return command_exit_code;
 
 	hwnd = _r_app_createwindow (hinst, MAKEINTRESOURCE (IDD_MAIN), MAKEINTRESOURCE (IDI_MAIN), &DlgProc);
 

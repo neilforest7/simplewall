@@ -884,7 +884,14 @@ INT_PTR CALLBACK EditorPagesProc (
 
 			// app hash
 			if (GetDlgItem (hwnd, IDC_APP_HASH_ID))
-				_r_ctrl_setstring (hwnd, IDC_APP_HASH_ID, _r_obj_getstringordefault (context->ptr_app->hash, L"<empty>"));
+			{
+				string = NULL;
+				_app_getappinfo (context->ptr_app, INFO_HASH, &string, sizeof (string));
+				_r_ctrl_setstring (hwnd, IDC_APP_HASH_ID, _r_obj_getstringordefault (string, L"<empty>"));
+
+				if (string)
+					_r_obj_dereference (string);
+			}
 
 			// app rules
 			if (GetDlgItem (hwnd, IDC_APP_RULES_ID))
@@ -1533,6 +1540,7 @@ INT_PTR CALLBACK EditorPagesProc (
 
 				case IDC_APP_HASH_RECHECK_ID:
 				{
+					PITEM_APP current_app;
 					PR_STRING string;
 					HANDLE hfile;
 					NTSTATUS status;
@@ -1558,7 +1566,26 @@ INT_PTR CALLBACK EditorPagesProc (
 					{
 						string = _app_getfilehashinfo (hfile, context->ptr_app->app_hash);
 
+						// An explicit recheck can reset the baseline only while monitoring
+						// is disabled and no previous monitor is still draining.
+						if (string && !_r_config_getboolean (L"IsEnableAppMonitor", FALSE) && !_app_monitor_isbusy ())
+						{
+							_r_queuedlock_acquireexclusive (&lock_apps);
+							current_app = _r_obj_findhashtablepointer (apps_table, context->ptr_app->app_hash);
+
+							if (current_app == context->ptr_app)
+								_r_obj_movereference (&current_app->hash, _r_obj_reference (string));
+
+							_r_queuedlock_releaseexclusive (&lock_apps);
+
+							if (current_app)
+								_r_obj_dereference (current_app);
+						}
+
 						_r_ctrl_setstring (hwnd, IDC_APP_HASH_ID, _r_obj_getstringordefault (string, L"<empty>"));
+
+						if (string)
+							_r_obj_dereference (string);
 
 						NtClose (hfile);
 					}
