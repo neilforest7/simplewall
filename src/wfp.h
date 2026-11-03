@@ -102,7 +102,7 @@ VOID _wfp_destroyfilters (
 	_In_ HANDLE engine_handle
 );
 
-VOID _wfp_destroyfilters_array (
+BOOLEAN _wfp_destroyfilters_array (
 	_In_ HANDLE engine_handle,
 	_Inout_ PR_ARRAY guids,
 	_In_ LPCWSTR file_name,
@@ -122,6 +122,8 @@ BOOLEAN _wfp_createrulefilter (
 	_In_ UINT32 flags,
 	_Inout_opt_ PR_ARRAY guids
 );
+
+BOOLEAN _wfp_autoallow_app (_In_opt_ HWND hwnd, _In_ PITEM_APP ptr_app, _In_ PITEM_LOG ptr_log);
 
 BOOLEAN _wfp_createrulefilters (
 	_In_ HANDLE engine_handle,

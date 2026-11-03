@@ -3,6 +3,21 @@
 
 #include "global.h"
 
+// XmlLite returns S_FALSE for a missing attribute; the routine value helper
+// intentionally accepts success codes and cannot distinguish missing from empty.
+static BOOLEAN _app_db_hasattribute (
+	_Inout_ PDB_INFORMATION db_info,
+	_In_ LPCWSTR name
+)
+{
+	HRESULT status;
+
+	status = IXmlReader_MoveToAttributeByName (db_info->xml_library.reader, name, NULL);
+	IXmlReader_MoveToElement (db_info->xml_library.reader);
+
+	return status == S_OK;
+}
+
 _Success_ (SUCCEEDED (return))
 HRESULT _app_db_initialize (
 	_Out_ PDB_INFORMATION db_info,
@@ -236,6 +251,7 @@ VOID _app_db_parse_app (
 		{
 			{
 				_app_setappinfo (ptr_app, INFO_IS_ENABLED, LongToPtr (_r_xml_getattribute_boolean (&db_info->xml_library, L"is_enabled")));
+				ptr_app->is_autoallow_blocked = _r_xml_getattribute_boolean (&db_info->xml_library, L"is_autoallow_blocked");
 				_app_setappinfo (ptr_app, INFO_IS_SILENT, LongToPtr (_r_xml_getattribute_boolean (&db_info->xml_library, L"is_silent")));
 				_app_setappinfo (ptr_app, INFO_IS_UNDELETABLE, LongToPtr (_r_xml_getattribute_boolean (&db_info->xml_library, L"is_undeletable")));
 
@@ -287,7 +303,8 @@ VOID _app_db_parse_app (
 
 VOID _app_db_parse_rule (
 	_Inout_ PDB_INFORMATION db_info,
-	_In_ ENUM_TYPE_DATA type
+	_In_ ENUM_TYPE_DATA type,
+	_In_ BOOLEAN is_automatic
 )
 {
 	PR_STRING comment, path_string = NULL, rule_name, rule_local, rule_remote, string;
@@ -341,6 +358,20 @@ VOID _app_db_parse_rule (
 	ptr_rule->is_enabled = _r_xml_getattribute_boolean (&db_info->xml_library, L"is_enabled");
 	ptr_rule->type = (type == DATA_RULE_SYSTEM_USER) ? DATA_RULE_USER : type;
 	ptr_rule->is_readonly = (type != DATA_RULE_USER);
+
+	ptr_rule->auto_filename = _r_xml_getattribute_string (&db_info->xml_library, L"auto_filename");
+	ptr_rule->auto_directory = _r_xml_getattribute_string (&db_info->xml_library, L"auto_directory");
+	ptr_rule->auto_publisher = _r_xml_getattribute_string (&db_info->xml_library, L"auto_publisher");
+
+	// Keep malformed/empty selector attributes scoped instead of degrading to global.
+	if (!ptr_rule->auto_filename && (is_automatic || _app_db_hasattribute (db_info, L"auto_filename") || ptr_rule->auto_directory || ptr_rule->auto_publisher || _app_db_hasattribute (db_info, L"auto_directory") || _app_db_hasattribute (db_info, L"auto_publisher")))
+		ptr_rule->auto_filename = _r_obj_createstring (L"");
+
+	if (_app_rule_hasauto (ptr_rule) && !_app_rule_autoisvalid (ptr_rule))
+	{
+		ptr_rule->is_enabled = FALSE;
+		ptr_rule->is_haveerrors = TRUE;
+	}
 
 	// calculate rule weight
 	if (type == DATA_RULE_BLOCKLIST)
@@ -454,9 +485,12 @@ VOID _app_db_parse_rule (
 		}
 
 		// check if no app is added into rule, then disable it!
-		if (ptr_rule->is_enabled && _r_obj_isempty (ptr_rule->apps))
+		if (ptr_rule->is_enabled && _app_rule_isglobal (ptr_rule))
 			ptr_rule->is_enabled = FALSE;
 	}
+
+	if (_app_rule_hasauto (ptr_rule) && !_app_rule_autoisvalid (ptr_rule))
+		ptr_rule->is_enabled = FALSE;
 
 	_r_queuedlock_acquireexclusive (&lock_rules);
 	_r_obj_addlistitem (rules_list, ptr_rule, NULL);
@@ -811,7 +845,16 @@ BOOLEAN _app_db_parse (
 			{
 				while (_r_xml_enumchilditemsbytagname (&db_info->xml_library, L"item"))
 				{
-					_app_db_parse_rule (db_info, DATA_RULE_USER);
+					_app_db_parse_rule (db_info, DATA_RULE_USER, FALSE);
+				}
+			}
+
+			// Upstream releases ignore this section instead of treating zero matches as global.
+			if (_r_xml_findchildbytagname (&db_info->xml_library, L"rules_auto"))
+			{
+				while (_r_xml_enumchilditemsbytagname (&db_info->xml_library, L"item"))
+				{
+					_app_db_parse_rule (db_info, DATA_RULE_USER, TRUE);
 				}
 			}
 
@@ -825,7 +868,7 @@ BOOLEAN _app_db_parse (
 			{
 				while (_r_xml_enumchilditemsbytagname (&db_info->xml_library, L"item"))
 				{
-					_app_db_parse_rule (db_info, DATA_RULE_SYSTEM);
+					_app_db_parse_rule (db_info, DATA_RULE_SYSTEM, FALSE);
 				}
 			}
 
@@ -834,7 +877,7 @@ BOOLEAN _app_db_parse (
 			{
 				while (_r_xml_enumchilditemsbytagname (&db_info->xml_library, L"item"))
 				{
-					_app_db_parse_rule (db_info, DATA_RULE_SYSTEM_USER);
+					_app_db_parse_rule (db_info, DATA_RULE_SYSTEM_USER, FALSE);
 				}
 			}
 
@@ -843,7 +886,7 @@ BOOLEAN _app_db_parse (
 			{
 				while (_r_xml_enumchilditemsbytagname (&db_info->xml_library, L"item"))
 				{
-					_app_db_parse_rule (db_info, DATA_RULE_BLOCKLIST);
+					_app_db_parse_rule (db_info, DATA_RULE_BLOCKLIST, FALSE);
 				}
 			}
 
@@ -1011,6 +1054,9 @@ VOID _app_db_save_app (
 		if (ptr_app->is_silent)
 			_r_xml_setattribute_boolean (&db_info->xml_library, L"is_silent", !!ptr_app->is_silent);
 
+		if (ptr_app->is_autoallow_blocked)
+			_r_xml_setattribute_boolean (&db_info->xml_library, L"is_autoallow_blocked", TRUE);
+
 		if (ptr_app->is_enabled)
 			_r_xml_setattribute_boolean (&db_info->xml_library, L"is_enabled", !!ptr_app->is_enabled);
 
@@ -1029,69 +1075,83 @@ VOID _app_db_save_rule (
 	PITEM_RULE ptr_rule;
 	PR_STRING apps_string;
 
-	_app_db_writeelementstart (db_info, L"rules_custom");
-
-	_r_queuedlock_acquireshared (&lock_rules);
-
-	for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules_list); i++)
+	// Keep selectors outside legacy rules_custom: an older binary must never
+	// reinterpret an executable selector with no manual apps as a global allow.
+	for (ULONG automatic = 0; automatic < 2; automatic++)
 	{
-		ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules_list, i);
+		_app_db_writeelementstart (db_info, automatic ? L"rules_auto" : L"rules_custom");
 
-		if (!ptr_rule || ptr_rule->is_readonly)
-			continue;
+		_r_queuedlock_acquireshared (&lock_rules);
 
-		_r_xml_writewhitespace (&db_info->xml_library, L"\r\n\t\t");
-		_r_xml_writestartelement (&db_info->xml_library, L"item");
-
-		_r_xml_setattribute (&db_info->xml_library, L"name", ptr_rule->name->buffer);
-
-		if (!_r_obj_isstringempty (ptr_rule->rule_remote))
-			_r_xml_setattribute (&db_info->xml_library, L"rule", ptr_rule->rule_remote->buffer);
-
-		if (!_r_obj_isstringempty (ptr_rule->rule_local))
-			_r_xml_setattribute (&db_info->xml_library, L"rule_local", ptr_rule->rule_local->buffer);
-
-		if (!_r_obj_isstringempty (ptr_rule->comment))
-			_r_xml_setattribute (&db_info->xml_library, L"comment", ptr_rule->comment->buffer);
-
-		// ffu!
-		if (ptr_rule->profile)
-			_r_xml_setattribute_long (&db_info->xml_library, L"profile", ptr_rule->profile);
-
-		if (ptr_rule->direction != FWP_DIRECTION_OUTBOUND)
-			_r_xml_setattribute_long (&db_info->xml_library, L"dir", ptr_rule->direction);
-
-		if (ptr_rule->protocol != 0)
-			_r_xml_setattribute_long (&db_info->xml_library, L"protocol", ptr_rule->protocol);
-
-		if (ptr_rule->af != AF_UNSPEC)
-			_r_xml_setattribute_long (&db_info->xml_library, L"version", ptr_rule->af);
-
-		// add apps attribute
-		if (!_r_obj_isempty (ptr_rule->apps))
+		for (ULONG_PTR i = 0; i < _r_obj_getlistsize (rules_list); i++)
 		{
-			apps_string = _app_rulesexpandapps (ptr_rule, FALSE, DIVIDER_APP);
+			ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules_list, i);
 
-			if (apps_string)
+			if (!ptr_rule || ptr_rule->is_readonly || (_app_rule_hasauto (ptr_rule) != (automatic != 0)))
+				continue;
+
+			_r_xml_writewhitespace (&db_info->xml_library, L"\r\n\t\t");
+			_r_xml_writestartelement (&db_info->xml_library, L"item");
+
+			_r_xml_setattribute (&db_info->xml_library, L"name", ptr_rule->name->buffer);
+
+			if (!_r_obj_isstringempty (ptr_rule->rule_remote))
+				_r_xml_setattribute (&db_info->xml_library, L"rule", ptr_rule->rule_remote->buffer);
+
+			if (!_r_obj_isstringempty (ptr_rule->rule_local))
+				_r_xml_setattribute (&db_info->xml_library, L"rule_local", ptr_rule->rule_local->buffer);
+
+			if (!_r_obj_isstringempty (ptr_rule->comment))
+				_r_xml_setattribute (&db_info->xml_library, L"comment", ptr_rule->comment->buffer);
+
+			// ffu!
+			if (ptr_rule->profile)
+				_r_xml_setattribute_long (&db_info->xml_library, L"profile", ptr_rule->profile);
+
+			if (ptr_rule->direction != FWP_DIRECTION_OUTBOUND)
+				_r_xml_setattribute_long (&db_info->xml_library, L"dir", ptr_rule->direction);
+
+			if (ptr_rule->protocol != 0)
+				_r_xml_setattribute_long (&db_info->xml_library, L"protocol", ptr_rule->protocol);
+
+			if (ptr_rule->af != AF_UNSPEC)
+				_r_xml_setattribute_long (&db_info->xml_library, L"version", ptr_rule->af);
+
+			if (ptr_rule->auto_filename)
+				_r_xml_setattribute (&db_info->xml_library, L"auto_filename", ptr_rule->auto_filename->buffer);
+
+			if (ptr_rule->auto_directory)
+				_r_xml_setattribute (&db_info->xml_library, L"auto_directory", ptr_rule->auto_directory->buffer);
+
+			if (ptr_rule->auto_publisher)
+				_r_xml_setattribute (&db_info->xml_library, L"auto_publisher", ptr_rule->auto_publisher->buffer);
+
+			// add apps attribute
+			if (!_r_obj_isempty (ptr_rule->apps))
 			{
-				_r_xml_setattribute (&db_info->xml_library, L"apps", apps_string->buffer);
+				apps_string = _app_rulesexpandapps (ptr_rule, FALSE, DIVIDER_APP);
 
-				_r_obj_dereference (apps_string);
+				if (apps_string)
+				{
+					_r_xml_setattribute (&db_info->xml_library, L"apps", apps_string->buffer);
+
+					_r_obj_dereference (apps_string);
+				}
 			}
+
+			if (ptr_rule->action == FWP_ACTION_BLOCK)
+				_r_xml_setattribute_boolean (&db_info->xml_library, L"is_block", TRUE);
+
+			if (ptr_rule->is_enabled)
+				_r_xml_setattribute_boolean (&db_info->xml_library, L"is_enabled", !!ptr_rule->is_enabled);
+
+			_r_xml_writeendelement (&db_info->xml_library);
 		}
 
-		if (ptr_rule->action == FWP_ACTION_BLOCK)
-			_r_xml_setattribute_boolean (&db_info->xml_library, L"is_block", TRUE);
+		_r_queuedlock_releaseshared (&lock_rules);
 
-		if (ptr_rule->is_enabled)
-			_r_xml_setattribute_boolean (&db_info->xml_library, L"is_enabled", !!ptr_rule->is_enabled);
-
-		_r_xml_writeendelement (&db_info->xml_library);
+		_app_db_writeelementend (db_info);
 	}
-
-	_r_queuedlock_releaseshared (&lock_rules);
-
-	_app_db_writeelementend (db_info);
 }
 
 VOID _app_db_save_ruleconfig (

@@ -2523,9 +2523,12 @@ INT_PTR CALLBACK DlgProc (
 					PR_LIST rules;
 					ULONG_PTR rule_idx;
 					ULONG app_hash;
-					BOOLEAN is_changed = FALSE, is_enabled;
+					BOOLEAN is_changed = FALSE, is_enabled, auto_block_changed;
 
 					if ((lpnmlv->uChanged & LVIF_STATE) == 0)
+						break;
+
+					if (((lpnmlv->uOldState ^ lpnmlv->uNewState) & LVIS_STATEIMAGEMASK) == 0)
 						break;
 
 					if ((lpnmlv->uNewState & LVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK (1) || ((lpnmlv->uNewState & LVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK (2)))
@@ -2543,9 +2546,13 @@ INT_PTR CALLBACK DlgProc (
 							if (!ptr_app)
 								break;
 
-							if (ptr_app->is_enabled != is_enabled)
+							if (ptr_app->is_enabled != is_enabled || ptr_app->is_autoallow_blocked == is_enabled)
 							{
+								_r_queuedlock_acquireexclusive (&lock_autoallow);
+								auto_block_changed = (ptr_app->is_autoallow_blocked != !is_enabled);
+								ptr_app->is_autoallow_blocked = !is_enabled;
 								ptr_app->is_enabled = is_enabled;
+								_r_queuedlock_releaseexclusive (&lock_autoallow);
 
 								_app_listview_lock (hwnd, (INT)(INT_PTR)lpnmlv->hdr.idFrom);
 								_app_setappiteminfo (hwnd, (INT)(INT_PTR)lpnmlv->hdr.idFrom, lpnmlv->iItem, ptr_app);
@@ -2566,9 +2573,12 @@ INT_PTR CALLBACK DlgProc (
 									_wfp_createappfilters (_wfp_getenginehandle (), rules, DBG_ARG, FALSE);
 
 									_r_obj_dereference (rules);
-
-									is_changed = TRUE;
 								}
+
+								if (auto_block_changed)
+									_app_autoallow_refresh (hwnd);
+
+								is_changed = TRUE;
 							}
 
 							_r_obj_dereference (ptr_app);

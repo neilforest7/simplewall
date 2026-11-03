@@ -1328,7 +1328,7 @@ VOID NTAPI _app_logthread (
 	PITEM_APP ptr_app = NULL;
 	PITEM_LOG ptr_log;
 	HWND hwnd;
-	BOOLEAN is_exludeallow, is_exludeblocklist, is_exludestealth, is_logenabled, is_loguienabled, is_notexist, is_notificationenabled, is_silent = FALSE;
+	BOOLEAN is_exludeallow, is_exludeblocklist, is_exludestealth, is_logenabled, is_loguienabled, is_notexist, is_notificationenabled, is_autoallowed = FALSE, is_silent = FALSE;
 
 	hwnd = _r_app_gethwnd ();
 
@@ -1355,6 +1355,9 @@ VOID NTAPI _app_logthread (
 	if (!ptr_app)
 		ptr_app = _app_getappitem (ptr_log->app_hash);
 
+	if (ptr_app && ptr_log->is_myprovider && !ptr_log->is_allow && !ptr_log->is_custom && !ptr_log->is_blocklist && !ptr_log->is_system && !ptr_app->is_autoallow_blocked)
+		is_autoallowed = _wfp_autoallow_app (hwnd, ptr_app, ptr_log);
+
 	is_notificationenabled = _r_config_getboolean (L"IsNotificationsEnabled", TRUE, NULL);
 	is_loguienabled = _r_config_getboolean (L"IsLogUiEnabled", FALSE, NULL);
 	is_logenabled = _r_config_getboolean (L"IsLogEnabled", FALSE, NULL);
@@ -1369,7 +1372,7 @@ VOID NTAPI _app_logthread (
 		ptr_log->local_addr_str = _app_formataddress (ptr_log->af, ptr_log->protocol, &ptr_log->local_addr, 0, 0);
 
 		// display notification
-		if (is_notificationenabled && ptr_app && ptr_log->is_myprovider && !ptr_log->is_allow && is_exludeblocklist)
+		if (is_notificationenabled && !is_autoallowed && ptr_app && ptr_log->is_myprovider && !ptr_log->is_allow && is_exludeblocklist)
 		{
 			if (_app_getappinfo (ptr_app, INFO_IS_SILENT, &is_silent, sizeof (BOOLEAN)) && !is_silent)
 				_app_notify_addobject (hwnd, ptr_log, ptr_app);

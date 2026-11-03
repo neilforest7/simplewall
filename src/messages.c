@@ -462,8 +462,8 @@ VOID _app_generate_rulescontrol (
 					if (!ptr_rule || ptr_rule->type != DATA_RULE_USER)
 						continue;
 
-					is_global = (ptr_rule->is_enabled && _r_obj_isempty (ptr_rule->apps));
-					is_enabled = is_global || (ptr_rule->is_enabled && (_r_obj_findhashtable (ptr_rule->apps, app_hash)));
+					is_global = (ptr_rule->is_enabled && _app_rule_isglobal (ptr_rule));
+					is_enabled = is_global || (ptr_rule->is_enabled && (_app_rule_containsapp (ptr_rule, app_hash)));
 
 					if ((type == 0 && (!ptr_rule->is_readonly || is_global)) || (type == 1 && (ptr_rule->is_readonly || is_global)))
 						continue;
@@ -1269,7 +1269,7 @@ VOID _app_displayinforule_callback (
 			{
 				if (ptr_rule->is_enabled)
 				{
-					lpnmlv->item.iGroupId = (ptr_rule->is_fordriver || ptr_rule->is_forservice || !_r_obj_isempty (ptr_rule->apps)) ? 1 : 0;
+					lpnmlv->item.iGroupId = (ptr_rule->is_fordriver || ptr_rule->is_forservice || !_app_rule_isglobal (ptr_rule)) ? 1 : 0;
 				}
 				else
 				{
@@ -1776,7 +1776,14 @@ VOID _app_command_idtorules (
 		_app_notify_freeobject (NULL, ptr_app);
 
 		if (is_remove == INT_ERROR)
-			is_remove = !!(ptr_rule->is_enabled && _r_obj_findhashtable (ptr_rule->apps, app_hash));
+			is_remove = !!(ptr_rule->is_enabled && _app_rule_containsapp (ptr_rule, app_hash));
+
+		if (is_remove && _app_rule_hasauto (ptr_rule) && _app_rule_containsapp (ptr_rule, app_hash))
+		{
+			_r_queuedlock_acquireexclusive (&lock_autoallow);
+			ptr_app->is_autoallow_blocked = TRUE;
+			_r_queuedlock_releaseexclusive (&lock_autoallow);
+		}
 
 		_app_setruletoapp (hwnd, ptr_rule, item_id, ptr_app, !is_remove);
 
@@ -1793,6 +1800,9 @@ VOID _app_command_idtorules (
 
 		_r_obj_dereference (rules);
 	}
+
+	if (_app_rule_hasauto (ptr_rule))
+		_app_autoallow_refresh (hwnd);
 
 	_app_listview_updateby_id (hwnd, tab_context->listview_id, 0);
 	_app_listview_updateitemby_param (hwnd, rule_idx, FALSE);
@@ -2103,8 +2113,11 @@ VOID _app_command_checkbox (
 			if (!ptr_app)
 				continue;
 
-			if (ptr_app->is_enabled != new_val)
+			if (ptr_app->is_enabled != new_val || ptr_app->is_autoallow_blocked == new_val)
 			{
+				_r_queuedlock_acquireexclusive (&lock_autoallow);
+				ptr_app->is_autoallow_blocked = !new_val;
+				_r_queuedlock_releaseexclusive (&lock_autoallow);
 				if (!new_val)
 				{
 					_app_timer_reset (hwnd, ptr_app, TRUE);
@@ -2134,6 +2147,9 @@ VOID _app_command_checkbox (
 
 		if (is_changed && _wfp_isfiltersinstalled ())
 			_wfp_createappfilters (_wfp_getenginehandle (), rules, DBG_ARG, FALSE);
+
+		if (is_changed)
+			_app_autoallow_refresh (hwnd);
 	}
 	else if (tab_context->listview_id >= IDC_RULES_BLOCKLIST && tab_context->listview_id <= IDC_RULES_CUSTOM)
 	{
@@ -2197,6 +2213,7 @@ VOID _app_command_delete (
 	LPARAM lparam;
 	ULONG hash_code;
 	INT item_count, selected_count;
+	BOOLEAN is_revoke_failed = FALSE;
 
 	tab_context = _app_listview_getcontext (hwnd, INT_ERROR);
 
@@ -2265,6 +2282,8 @@ VOID _app_command_delete (
 
 	guids = _r_obj_createarray (sizeof (GUID), 0x10, NULL);
 
+	_r_queuedlock_acquireexclusive (&lock_autoallow);
+
 	for (INT i = item_count - 1; i != INT_ERROR; i--)
 	{
 		if (!_r_listview_isitemselected (hwnd, tab_context->listview_id, i))
@@ -2289,7 +2308,7 @@ VOID _app_command_delete (
 				_app_timer_reset (hwnd, ptr_app, FALSE);
 
 				_r_queuedlock_acquireexclusive (&lock_apps);
-				_app_freeapplication (hwnd, hash_code);
+				_app_freeapplication (hwnd, (ULONG)hash_code);
 				_r_queuedlock_releaseexclusive (&lock_apps);
 			}
 
@@ -2305,10 +2324,18 @@ VOID _app_command_delete (
 
 			if (!ptr_rule->is_readonly) // skip "read-only" rules
 			{
-				apps_checker = _r_obj_createhashtable (sizeof (SHORT), 0x10, NULL);
+				// Revoke while the rule still owns its IDs and remains visible.
+				// A Windows failure must not orphan an automatic permit.
+				if (!_wfp_destroyfilters_array (_wfp_getenginehandle (), ptr_rule->guids, DBG_ARG))
+				{
+					is_revoke_failed = TRUE;
+					ptr_rule->is_haveerrors = TRUE;
+					_app_listview_updateitemby_param (hwnd, rule_idx, FALSE);
+					_r_obj_dereference (ptr_rule);
+					continue;
+				}
 
-				if (!_r_obj_isempty (ptr_rule->guids))
-					_r_obj_addarrayitems (guids, ptr_rule->guids->items, ptr_rule->guids->count);
+				apps_checker = _r_obj_createhashtable (sizeof (SHORT), 0x10, NULL);
 
 				enum_key = 0;
 
@@ -2316,6 +2343,14 @@ VOID _app_command_delete (
 				{
 					_r_obj_addhashtableitem (apps_checker, hash_code, NULL);
 				}
+
+				enum_key = 0;
+				_r_queuedlock_acquireshared (&lock_autoapps);
+
+				while (_r_obj_enumhashtable (ptr_rule->auto_apps, NULL, &hash_code, &enum_key))
+					_r_obj_addhashtableitem (apps_checker, hash_code, NULL);
+
+				_r_queuedlock_releaseshared (&lock_autoapps);
 
 				_r_listview_deleteitem (hwnd, tab_context->listview_id, i);
 
@@ -2369,6 +2404,11 @@ VOID _app_command_delete (
 
 	if (!_r_obj_isempty (guids) && _wfp_isfiltersinstalled ())
 		_wfp_destroyfilters_array (_wfp_getenginehandle (), guids, DBG_ARG);
+
+	_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+	if (!is_revoke_failed)
+		_app_autoallow_refresh (hwnd);
 
 	_app_listview_updateby_id (hwnd, tab_context->listview_id, 0);
 
@@ -2785,7 +2825,7 @@ VOID _app_command_purgeunused (
 	ULONG hash_code;
 	INT i = 1;
 
-	apps_list = _r_obj_createlist (0x10, NULL);
+	apps_list = _r_obj_createlist (0x10, &_r_obj_dereference);
 	guids = _r_obj_createarray (sizeof (GUID), 0x10, NULL);
 
 	_r_obj_initializestringbuilder (&sb, 0);
@@ -2800,7 +2840,7 @@ VOID _app_command_purgeunused (
 		if (!_r_obj_isempty (ptr_app->guids))
 			_r_obj_addarrayitems (guids, ptr_app->guids->items, ptr_app->guids->count);
 
-		_r_obj_addlistitem (apps_list, ptr_app, NULL);
+		_r_obj_addlistitem (apps_list, _r_obj_reference (ptr_app), NULL);
 
 		string = _app_getapppath (ptr_app);
 
@@ -2826,7 +2866,7 @@ VOID _app_command_purgeunused (
 
 		if (_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_PURGE_UNUSED), string->buffer, L"ConfirmUnused", FALSE))
 		{
-			//_r_queuedlock_acquireexclusive (&lock_apps);
+			_r_queuedlock_acquireexclusive (&lock_autoallow);
 
 			for (ULONG_PTR i = 0; i < _r_obj_getlistsize (apps_list); i++)
 			{
@@ -2841,10 +2881,14 @@ VOID _app_command_purgeunused (
 				_app_notify_freeobject (NULL, ptr_app);
 				_app_timer_reset (NULL, ptr_app, FALSE);
 
-				_app_freeapplication (hwnd, hash_code);
+				_r_queuedlock_acquireexclusive (&lock_apps);
+				_app_freeapplication (hwnd, (ULONG)hash_code);
+				_r_queuedlock_releaseexclusive (&lock_apps);
 			}
 
-			//_r_queuedlock_releaseexclusive (&lock_apps);
+			_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+			_app_autoallow_refresh (hwnd);
 
 			if (!_r_obj_isempty2 (guids) && _wfp_isfiltersinstalled ())
 				_wfp_destroyfilters_array (_wfp_getenginehandle (), guids, DBG_ARG);

@@ -1,0 +1,38 @@
+name: Automatic application rule tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rule-scope:
+    name: Rule scope, XML and revocation regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Exercise production scope and XML guards
+        run: |
+          python3 tests/autoallow_scope_test.py
+          python3 tests/autoallow_xml_presence_test.py
+          python3 tests/autoallow_revoke_test.py
+
+  windows-matcher:
+    name: Windows filename, directory and Authenticode matcher
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Compile and run the standalone matcher tests
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          cl /nologo /W4 /WX /DUNICODE /D_UNICODE /Fe:autoallow_match_test.exe tests\autoallow_match_test.c src\autoallow_match.c
+          if errorlevel 1 exit /b 1
+          autoallow_match_test.exe "%ProgramFiles%\PowerShell\7\pwsh.exe"
+          if errorlevel 1 exit /b 1

@@ -78,7 +78,10 @@ BOOLEAN _app_notify_command (
 
 	if (button_id == IDC_ALLOW_BTN || button_id == IDC_BLOCK_BTN)
 	{
+		_r_queuedlock_acquireexclusive (&lock_autoallow);
 		ptr_app->is_enabled = (button_id == IDC_ALLOW_BTN);
+		ptr_app->is_autoallow_blocked = (button_id == IDC_BLOCK_BTN);
+		_r_queuedlock_releaseexclusive (&lock_autoallow);
 		ptr_app->is_silent = (button_id == IDC_BLOCK_BTN);
 
 		if (ptr_app->is_enabled && seconds > 0)
@@ -106,6 +109,9 @@ BOOLEAN _app_notify_command (
 
 	if (!_r_obj_isempty2 (rules) && _wfp_isfiltersinstalled ())
 		_wfp_createappfilters (_wfp_getenginehandle (), rules, DBG_ARG, FALSE);
+
+	if (button_id == IDC_ALLOW_BTN || button_id == IDC_BLOCK_BTN)
+		_app_autoallow_refresh (hmain);
 
 	if (hmain)
 		_app_listview_updateby_id (hmain, ptr_app->type, PR_UPDATE_TYPE);
@@ -1233,13 +1239,20 @@ INT_PTR CALLBACK NotificationProc (
 
 				if (!((ptr_rule->is_fordriver || ptr_rule->is_forservice) && _app_issystemhash (app_hash)))
 				{
-					is_remove = ptr_rule->is_enabled && _r_obj_findhashtable (ptr_rule->apps, app_hash);
+					_r_queuedlock_acquireexclusive (&lock_autoallow);
+
+					is_remove = ptr_rule->is_enabled && _app_rule_containsapp (ptr_rule, app_hash);
 
 					if (is_remove)
 					{
+						if (_app_rule_hasauto (ptr_rule))
+						{
+							ptr_app->is_autoallow_blocked = TRUE;
+						}
+
 						_r_obj_removehashtableitem (ptr_rule->apps, app_hash);
 
-						if (_r_obj_isempty (ptr_rule->apps))
+						if (_app_rule_isglobal (ptr_rule))
 							_app_ruleenable (ptr_rule, FALSE, TRUE);
 					}
 					else
@@ -1248,6 +1261,8 @@ INT_PTR CALLBACK NotificationProc (
 
 						_app_ruleenable (ptr_rule, TRUE, TRUE);
 					}
+
+					_r_queuedlock_releaseexclusive (&lock_autoallow);
 
 					if (hmain)
 					{
@@ -1265,6 +1280,9 @@ INT_PTR CALLBACK NotificationProc (
 
 						_r_obj_dereference (rules);
 					}
+
+					if (_app_rule_hasauto (ptr_rule))
+						_app_autoallow_refresh (hmain);
 
 					if (hmain)
 						_app_listview_updateby_id (hmain, DATA_LISTVIEW_CURRENT, PR_UPDATE_TYPE);

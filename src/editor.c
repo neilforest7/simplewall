@@ -2,6 +2,80 @@
 // Copyright (c) 2016-2026 Henry++
 
 #include "global.h"
+#include <wchar.h>
+
+// Validate before updating any part of the shared rule. The strings are read
+// again only after validation, and the controls do not change in between.
+static BOOLEAN _app_editor_validateautoapps (HWND hwnd, HWND hpage, HWND hgeneral, PITEM_RULE ptr_rule)
+{
+	PR_STRING filename, directory, publisher;
+	PCWSTR filename_text, directory_text, publisher_text;
+	HWND hcurrent;
+	UINT error_id = 0;
+	INT control_id = IDC_AUTO_FILENAME_ID, item_id, tab_id = 3;
+
+	filename = _r_ctrl_getstring (hpage, IDC_AUTO_FILENAME_ID);
+	directory = _r_ctrl_getstring (hpage, IDC_AUTO_DIRECTORY_ID);
+	publisher = _r_ctrl_getstring (hpage, IDC_AUTO_PUBLISHER_ID);
+	filename_text = _r_obj_getstringordefault (filename, L"");
+	directory_text = _r_obj_getstringordefault (directory, L"");
+	publisher_text = _r_obj_getstringordefault (publisher, L"");
+
+	if (!*filename_text && (*directory_text || *publisher_text))
+	{
+		error_id = IDS_AUTO_ERROR_REQUIRED;
+	}
+	else if (*filename_text && !sw_autoallow_valid_filename (filename_text))
+	{
+		error_id = IDS_AUTO_ERROR_FILENAME;
+	}
+	else if (*directory_text && !sw_autoallow_valid_directory (directory_text))
+	{
+		error_id = IDS_AUTO_ERROR_DIRECTORY;
+		control_id = IDC_AUTO_DIRECTORY_ID;
+	}
+	else if (wcschr (publisher_text, L'*') || wcschr (publisher_text, L'?'))
+	{
+		error_id = IDS_AUTO_ERROR_PUBLISHER;
+		control_id = IDC_AUTO_PUBLISHER_ID;
+	}
+	else if (*filename_text)
+	{
+		item_id = _r_combobox_getcurrentitem (hgeneral, IDC_RULE_ACTION_ID);
+
+		if (ptr_rule->is_forservice || ptr_rule->is_fordriver)
+		{
+			error_id = IDS_AUTO_ERROR_SERVICE;
+		}
+		else if ((FWP_ACTION_TYPE)_r_combobox_getitemlparam (hgeneral, IDC_RULE_ACTION_ID, item_id) != FWP_ACTION_PERMIT)
+		{
+			error_id = IDS_AUTO_ERROR_ACTION;
+			control_id = IDC_RULE_ACTION_ID;
+			tab_id = 0;
+		}
+	}
+
+	if (filename)
+		_r_obj_dereference (filename);
+	if (directory)
+		_r_obj_dereference (directory);
+	if (publisher)
+		_r_obj_dereference (publisher);
+
+	if (!error_id)
+		return TRUE;
+
+	hcurrent = (HWND)_r_tab_getitemlparam (hwnd, IDC_TAB, _r_tab_getcurrentitem (hwnd, IDC_TAB));
+	if (hcurrent)
+		ShowWindow (hcurrent, SW_HIDE);
+	_r_tab_selectitem (hwnd, IDC_TAB, tab_id);
+	hpage = tab_id == 0 ? hgeneral : hpage;
+	_r_tab_adjustchild (hwnd, IDC_TAB, hpage);
+	ShowWindow (hpage, SW_SHOWNA);
+	MessageBoxW (hwnd, _r_locale_getstring (error_id), NULL, MB_OK | MB_ICONWARNING);
+	SetFocus (GetDlgItem (hpage, control_id));
+	return FALSE;
+}
 
 _Ret_maybenull_
 PEDITOR_CONTEXT _app_editor_createwindow (
@@ -672,6 +746,38 @@ INT_PTR CALLBACK EditorPagesProc (
 				_app_listview_sort (hwnd, IDC_RULE_APPS_ID, INT_ERROR, FALSE);
 			}
 
+			if (GetDlgItem (hwnd, IDC_AUTO_FILENAME_ID))
+			{
+				PR_STRING auto_filename, auto_directory, auto_publisher;
+
+				_r_queuedlock_acquireshared (&lock_autoallow);
+				auto_filename = context->ptr_rule->auto_filename ? _r_obj_reference (context->ptr_rule->auto_filename) : NULL;
+				auto_directory = context->ptr_rule->auto_directory ? _r_obj_reference (context->ptr_rule->auto_directory) : NULL;
+				auto_publisher = context->ptr_rule->auto_publisher ? _r_obj_reference (context->ptr_rule->auto_publisher) : NULL;
+				_r_queuedlock_releaseshared (&lock_autoallow);
+
+				_r_ctrl_setstringformat (hwnd, IDC_AUTO_FILENAME, L"%s:", _r_locale_getstring (IDS_AUTO_FILENAME));
+				_r_ctrl_setstringformat (hwnd, IDC_AUTO_DIRECTORY, L"%s:", _r_locale_getstring (IDS_AUTO_DIRECTORY));
+				_r_ctrl_setstringformat (hwnd, IDC_AUTO_PUBLISHER, L"%s:", _r_locale_getstring (IDS_AUTO_PUBLISHER));
+				_r_ctrl_setstring (hwnd, IDC_AUTO_HINT, _r_locale_getstring (IDS_AUTO_HINT));
+				_r_ctrl_setstring (hwnd, IDC_AUTO_FILENAME_ID, _r_obj_getstring (auto_filename));
+				_r_ctrl_setstring (hwnd, IDC_AUTO_DIRECTORY_ID, _r_obj_getstring (auto_directory));
+				_r_ctrl_setstring (hwnd, IDC_AUTO_PUBLISHER_ID, _r_obj_getstring (auto_publisher));
+				if (auto_filename)
+					_r_obj_dereference (auto_filename);
+				if (auto_directory)
+					_r_obj_dereference (auto_directory);
+				if (auto_publisher)
+					_r_obj_dereference (auto_publisher);
+				_r_edit_settextlimit (hwnd, IDC_AUTO_FILENAME_ID, 255);
+				_r_edit_settextlimit (hwnd, IDC_AUTO_DIRECTORY_ID, 32767);
+				_r_edit_settextlimit (hwnd, IDC_AUTO_PUBLISHER_ID, 1023);
+				_r_edit_setcuebanner (hwnd, IDC_AUTO_FILENAME_ID, L"blender.exe");
+				_r_edit_setreadonly (hwnd, IDC_AUTO_FILENAME_ID, !!context->ptr_rule->is_readonly);
+				_r_edit_setreadonly (hwnd, IDC_AUTO_DIRECTORY_ID, !!context->ptr_rule->is_readonly);
+				_r_edit_setreadonly (hwnd, IDC_AUTO_PUBLISHER_ID, !!context->ptr_rule->is_readonly);
+			}
+
 			// app group
 			if (GetDlgItem (hwnd, IDC_APP_NAME))
 				_r_ctrl_setstringformat (hwnd, IDC_APP_NAME, L"%s:", _r_locale_getstring (IDS_SETTINGS_GENERAL));
@@ -713,6 +819,12 @@ INT_PTR CALLBACK EditorPagesProc (
 				_r_ctrl_setstring (hwnd, IDC_APP_COMMENT_ID, _r_obj_getstring (context->ptr_app->comment));
 
 				_r_edit_setmargin (hwnd, IDC_APP_COMMENT_ID, 0, 0);
+			}
+
+			if (GetDlgItem (hwnd, IDC_APP_AUTO_BLOCK_CHK))
+			{
+				_r_ctrl_setstring (hwnd, IDC_APP_AUTO_BLOCK_CHK, _r_locale_getstring (IDS_AUTO_BLOCK_CHK));
+				_r_button_setcheck (hwnd, IDC_APP_AUTO_BLOCK_CHK, !!context->ptr_app->is_autoallow_blocked);
 			}
 
 			// app signature
@@ -805,13 +917,13 @@ INT_PTR CALLBACK EditorPagesProc (
 
 			// hints
 			if (GetDlgItem (hwnd, IDC_RULE_APPS_HINT))
-				_r_ctrl_setstring (hwnd, IDC_RULE_APPS_HINT, _r_locale_getstring (IDS_RULE_APPS_HINT));
+				_r_ctrl_setstring (hwnd, IDC_RULE_APPS_HINT, _r_locale_getstring (context->ptr_rule->type == DATA_RULE_USER ? IDS_AUTO_APPS_HINT : IDS_RULE_APPS_HINT));
 
 			if (GetDlgItem (hwnd, IDC_RULE_HINT))
 				_r_ctrl_setstring (hwnd, IDC_RULE_HINT, _r_locale_getstring (IDS_RULE_HINT));
 
 			if (GetDlgItem (hwnd, IDC_APP_HINT))
-				_r_ctrl_setstring (hwnd, IDC_APP_HINT, _r_locale_getstring (IDS_APP_HINT));
+				_r_ctrl_setstring (hwnd, IDC_APP_HINT, _r_locale_getstring (IDS_AUTO_APP_RULES_HINT));
 
 			break;
 		}
@@ -1476,6 +1588,9 @@ INT_PTR CALLBACK EditorProc (
 				_app_editor_addtabitem (hwnd, IDS_RULE, IDD_EDITOR_RULE, context);
 				_app_editor_addtabitem (hwnd, IDS_TAB_APPS, IDD_EDITOR_APPS, context);
 
+				if (context->ptr_rule->type == DATA_RULE_USER)
+					_app_editor_addtabitem (hwnd, IDS_TAB_AUTOAPPS, IDD_EDITOR_AUTOAPPS, context);
+
 				// set state
 				_r_ctrl_setstring (hwnd, IDC_ENABLE_CHK, _r_locale_getstring (IDS_ENABLE_CHK));
 
@@ -1654,14 +1769,21 @@ INT_PTR CALLBACK EditorProc (
 				case IDC_SAVE:
 				{
 
-					HWND hmain, hpage_apps, hpage_general, hpage_rule;
+					HWND hmain, hpage_apps, hpage_general, hpage_rule, hpage_auto;
 					PR_LIST rules = NULL;
 					PITEM_RULE ptr_rule;
-					PR_STRING string;
+					PR_STRING string, rule_name = NULL, rule_comment = NULL, rule_remote = NULL, rule_local = NULL, protocol_string = NULL;
+					PR_STRING auto_filename = NULL, auto_directory = NULL, auto_publisher = NULL;
+					PR_HASHTABLE staged_apps = NULL;
 					WCHAR buffer[0x80];
-					ULONG_PTR rule_idx;
+					ULONG_PTR rule_idx, enum_key;
 					ULONG app_hash;
+					UINT8 protocol = 0;
+					ADDRESS_FAMILY af = AF_UNSPEC;
+					FWP_DIRECTION direction = FWP_DIRECTION_MAX;
+					FWP_ACTION_TYPE action = FWP_ACTION_BLOCK;
 					INT item_id, listview_id;
+					BOOLEAN auto_block_changed = FALSE, auto_blocked, disable_autoclear = FALSE, was_auto_cleared = FALSE, rule_enabled;
 
 					context = _app_editor_getcontext (hwnd);
 
@@ -1674,99 +1796,138 @@ INT_PTR CALLBACK EditorProc (
 					if (context->is_settorules)
 					{
 						hpage_apps = (HWND)_r_tab_getitemlparam (hwnd, IDC_TAB, 2);
+						hpage_auto = context->ptr_rule->type == DATA_RULE_USER ? (HWND)_r_tab_getitemlparam (hwnd, IDC_TAB, 3) : NULL;
 
 						if (!hpage_general || !_r_ctrl_getstringlength (hpage_general, IDC_RULE_NAME_ID))
 							return FALSE;
 
-						context->ptr_rule->is_haveerrors = FALSE; // reset errors
+						if (hpage_auto && !context->ptr_rule->is_readonly && !_app_editor_validateautoapps (hwnd, hpage_auto, hpage_general, context->ptr_rule))
+							return FALSE;
 
-						// do not change read-only rules
+						// Gather and validate every input before touching the shared rule.
+						rule_enabled = _r_button_ischecked (hwnd, IDC_ENABLE_CHK);
+
 						if (!context->ptr_rule->is_readonly)
 						{
-							// name
-							string = _r_ctrl_getstring (hpage_general, IDC_RULE_NAME_ID);
+							rule_name = _r_ctrl_getstring (hpage_general, IDC_RULE_NAME_ID);
 
-							if (!string)
+							if (!rule_name)
 								return FALSE;
 
-							_r_str_trimstring2 (&string->sr, DIVIDER_TRIM DIVIDER_RULE, 0);
+							_r_str_trimstring2 (&rule_name->sr, DIVIDER_TRIM DIVIDER_RULE, 0);
 
-							if (_r_obj_isstringempty2 (string))
+							if (_r_obj_isstringempty2 (rule_name))
 							{
 								_r_edit_showballoontip (hpage_general, IDC_RULE_NAME_ID, 0, NULL, _r_locale_getstring (IDS_STATUS_EMPTY));
-
-								_r_obj_dereference (string);
-
+								_r_obj_dereference (rule_name);
 								return FALSE;
 							}
 
-							_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->name, string);
-
-							context->ptr_rule->rule_hash = _r_str_gethash (&context->ptr_rule->name->sr, TRUE); // change rule hash if it is changed
-
-							// comment
-							string = _r_ctrl_getstring (hpage_general, IDC_RULE_COMMENT_ID);
-
-							if (string)
-								_r_str_trimstring2 (&string->sr, DIVIDER_TRIM DIVIDER_RULE, 0);
-
-							_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->comment, string);
+							rule_comment = _r_ctrl_getstring (hpage_general, IDC_RULE_COMMENT_ID);
+							if (rule_comment)
+								_r_str_trimstring2 (&rule_comment->sr, DIVIDER_TRIM DIVIDER_RULE, 0);
 
 							if (hpage_rule)
 							{
-								// rule (remote)
-								_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->rule_remote, _app_editor_getrulesfromlistview (hpage_rule, IDC_RULE_REMOTE_ID, INT_ERROR));
-
-								// rule (local)
-								_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->rule_local, _app_editor_getrulesfromlistview (hpage_rule, IDC_RULE_LOCAL_ID, INT_ERROR));
+								rule_remote = _app_editor_getrulesfromlistview (hpage_rule, IDC_RULE_REMOTE_ID, INT_ERROR);
+								rule_local = _app_editor_getrulesfromlistview (hpage_rule, IDC_RULE_LOCAL_ID, INT_ERROR);
 							}
 
 							item_id = _r_combobox_getcurrentitem (hpage_general, IDC_RULE_PROTOCOL_ID);
-
-							context->ptr_rule->protocol = (UINT8)_r_combobox_getitemlparam (hpage_general, IDC_RULE_PROTOCOL_ID, item_id);
-
+							protocol = (UINT8)_r_combobox_getitemlparam (hpage_general, IDC_RULE_PROTOCOL_ID, item_id);
 							item_id = _r_combobox_getcurrentitem (hpage_general, IDC_RULE_VERSION_ID);
-
-							context->ptr_rule->af = (ADDRESS_FAMILY)_r_combobox_getitemlparam (hpage_general, IDC_RULE_VERSION_ID, item_id);
-
-							_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"<unknown protocol> (% " TEXT (PRIu8) L")", context->ptr_rule->protocol);
-
-							_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->protocol_str, _r_obj_createstring (_app_db_getprotoname (context->ptr_rule->protocol, context->ptr_rule->af, buffer)));
-
+							af = (ADDRESS_FAMILY)_r_combobox_getitemlparam (hpage_general, IDC_RULE_VERSION_ID, item_id);
+							_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"<unknown protocol> (% " TEXT (PRIu8) L")", protocol);
+							protocol_string = _r_obj_createstring (_app_db_getprotoname (protocol, af, buffer));
 							item_id = _r_combobox_getcurrentitem (hpage_general, IDC_RULE_DIRECTION_ID);
-
-							context->ptr_rule->direction = (FWP_DIRECTION)_r_combobox_getitemlparam (hpage_general, IDC_RULE_DIRECTION_ID, item_id);
-
+							direction = (FWP_DIRECTION)_r_combobox_getitemlparam (hpage_general, IDC_RULE_DIRECTION_ID, item_id);
 							item_id = _r_combobox_getcurrentitem (hpage_general, IDC_RULE_ACTION_ID);
+							action = (FWP_ACTION_TYPE)_r_combobox_getitemlparam (hpage_general, IDC_RULE_ACTION_ID, item_id);
 
-							context->ptr_rule->action = (FWP_ACTION_TYPE)_r_combobox_getitemlparam (hpage_general, IDC_RULE_ACTION_ID, item_id);
+							if (hpage_auto)
+							{
+								auto_filename = _r_ctrl_getstring (hpage_auto, IDC_AUTO_FILENAME_ID);
+								auto_directory = _r_ctrl_getstring (hpage_auto, IDC_AUTO_DIRECTORY_ID);
+								auto_publisher = _r_ctrl_getstring (hpage_auto, IDC_AUTO_PUBLISHER_ID);
 
-							if (context->ptr_rule->type == DATA_RULE_USER)
-								context->ptr_rule->weight = (context->ptr_rule->action == FWP_ACTION_BLOCK) ? FWW_RULE_USER_BLOCK : FWW_RULE_USER;
+								// NULL means no selector; non-NULL empty fields scope malformed profiles.
+								if (auto_filename && _r_obj_isstringempty (auto_filename))
+									_r_obj_movereference ((PVOID_PTR)&auto_filename, NULL);
+								if (auto_directory && _r_obj_isstringempty (auto_directory))
+									_r_obj_movereference ((PVOID_PTR)&auto_directory, NULL);
+								if (auto_publisher && _r_obj_isstringempty (auto_publisher))
+									_r_obj_movereference ((PVOID_PTR)&auto_publisher, NULL);
+							}
 						}
 
-						// save rule apps
 						if (context->ptr_rule->type == DATA_RULE_USER)
 						{
-							_r_obj_clearhashtable (context->ptr_rule->apps);
-
+							staged_apps = _r_obj_createhashtable (sizeof (SHORT), 0x02, NULL);
 							for (INT i = 0; i < _r_listview_getitemcount (hpage_apps, IDC_RULE_APPS_ID); i++)
 							{
 								if (!_r_listview_isitemchecked (hpage_apps, IDC_RULE_APPS_ID, i))
 									continue;
-
 								app_hash = (ULONG)_app_listview_getitemcontext (hpage_apps, IDC_RULE_APPS_ID, i);
-
 								if ((context->ptr_rule->is_fordriver || context->ptr_rule->is_forservice) && _app_issystemhash (app_hash))
 									continue;
-
 								if (_app_isappfound (app_hash))
-									_r_obj_addhashtableitem (context->ptr_rule->apps, app_hash, NULL);
+									_r_obj_addhashtableitem (staged_apps, app_hash, NULL);
 							}
 						}
 
-						// enable rule
-						_app_ruleenable (context->ptr_rule, _r_button_ischecked (hwnd, IDC_ENABLE_CHK), TRUE);
+						// Background automatic-rule rebuilds read every field below under this lock.
+						// Do not call controls, perform matching, or rebuild WFP filters while held.
+						_r_queuedlock_acquireexclusive (&lock_autoallow);
+						context->ptr_rule->is_haveerrors = FALSE;
+
+						if (!context->ptr_rule->is_readonly)
+						{
+							_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->name, rule_name);
+							context->ptr_rule->rule_hash = _r_str_gethash (&context->ptr_rule->name->sr, TRUE);
+							_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->comment, rule_comment);
+							if (hpage_rule)
+							{
+								_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->rule_remote, rule_remote);
+								_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->rule_local, rule_local);
+							}
+							context->ptr_rule->protocol = protocol;
+							context->ptr_rule->af = af;
+							_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->protocol_str, protocol_string);
+							context->ptr_rule->direction = direction;
+							context->ptr_rule->action = action;
+							if (hpage_auto)
+							{
+								was_auto_cleared = _app_rule_hasauto (context->ptr_rule) && !auto_filename;
+								_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->auto_filename, auto_filename);
+								_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->auto_directory, auto_directory);
+								_r_obj_movereference ((PVOID_PTR)&context->ptr_rule->auto_publisher, auto_publisher);
+							}
+							if (context->ptr_rule->type == DATA_RULE_USER)
+								context->ptr_rule->weight = action == FWP_ACTION_BLOCK ? FWW_RULE_USER_BLOCK : FWW_RULE_USER;
+						}
+
+						if (staged_apps)
+						{
+							_r_obj_clearhashtable (context->ptr_rule->apps);
+							enum_key = 0;
+							while (_r_obj_enumhashtable (staged_apps, NULL, &app_hash, &enum_key))
+								_r_obj_addhashtableitem (context->ptr_rule->apps, app_hash, NULL);
+						}
+
+						disable_autoclear = was_auto_cleared && _r_obj_isempty (context->ptr_rule->apps);
+						_app_ruleenable (context->ptr_rule, !disable_autoclear && rule_enabled, TRUE);
+						_r_queuedlock_releaseexclusive (&lock_autoallow);
+
+						if (staged_apps)
+							_r_obj_dereference (staged_apps);
+
+						// Keep derived membership current even while filtering is disabled.
+						if (hpage_auto && !_wfp_isfiltersinstalled ())
+						{
+							_r_queuedlock_acquireexclusive (&lock_autoallow);
+							_app_rule_refresh_autoapps (context->ptr_rule);
+							_r_queuedlock_releaseexclusive (&lock_autoallow);
+						}
 
 						rules = _r_obj_createlist (1, NULL);
 
@@ -1774,6 +1935,11 @@ INT_PTR CALLBACK EditorProc (
 					}
 					else
 					{
+						auto_blocked = _r_button_ischecked (hpage_general, IDC_APP_AUTO_BLOCK_CHK);
+						_r_queuedlock_acquireexclusive (&lock_autoallow);
+						auto_block_changed = (context->ptr_app->is_autoallow_blocked != auto_blocked);
+						context->ptr_app->is_autoallow_blocked = auto_blocked;
+						_r_queuedlock_releaseexclusive (&lock_autoallow);
 						context->ptr_app->is_haveerrors = FALSE; // reset errors
 						context->ptr_app->is_enabled = _r_button_ischecked (hwnd, IDC_ENABLE_CHK);
 
@@ -1791,12 +1957,10 @@ INT_PTR CALLBACK EditorProc (
 
 						if (hpage_rule)
 						{
-							_r_queuedlock_acquireshared (&lock_rules);
-
 							for (INT i = 0; i < _r_listview_getitemcount (hpage_rule, IDC_APP_RULES_ID); i++)
 							{
 								rule_idx = _app_listview_getitemcontext (hpage_rule, IDC_APP_RULES_ID, i);
-								ptr_rule = (PITEM_RULE)_r_obj_getlistitem (rules_list, rule_idx);
+								ptr_rule = _app_getrulebyid (rule_idx);
 
 								if (!ptr_rule)
 									continue;
@@ -1815,9 +1979,9 @@ INT_PTR CALLBACK EditorProc (
 											_app_setruletoapp (hmain, ptr_rule, item_id, context->ptr_app, _r_listview_isitemchecked (hpage_rule, IDC_APP_RULES_ID, i));
 									}
 								}
-							}
 
-							_r_queuedlock_releaseshared (&lock_rules);
+								_r_obj_dereference (ptr_rule);
+							}
 						}
 					}
 
@@ -1838,6 +2002,12 @@ INT_PTR CALLBACK EditorProc (
 
 						_r_obj_dereference (rules);
 					}
+
+					if (auto_block_changed)
+						_app_autoallow_refresh (_r_app_gethwnd ());
+
+					if (disable_autoclear)
+						MessageBoxW (hwnd, _r_locale_getstring (IDS_AUTO_CLEARED_DISABLED), NULL, MB_OK | MB_ICONINFORMATION);
 
 					EndDialog (hwnd, 1);
 
