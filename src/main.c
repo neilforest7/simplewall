@@ -48,7 +48,9 @@ static BOOLEAN _app_monitor_finish_drain (HWND hwnd)
 	KillTimer (hwnd, APP_MONITOR_DRAIN_TIMER);
 	if (monitor_closing)
 	{
+		_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: before DestroyWindow", 0, NULL);
 		DestroyWindow (hwnd);
+		_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: after DestroyWindow", 0, NULL);
 		return TRUE;
 	}
 
@@ -2511,6 +2513,7 @@ INT_PTR CALLBACK DlgProc (
 		{
 			HANDLE hengine;
 
+			_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: WM_DESTROY entered", 0, NULL);
 			_app_loginit (FALSE);
 
 			if (_r_queuedlock_islocked (&lock_apply))
@@ -2521,9 +2524,11 @@ INT_PTR CALLBACK DlgProc (
 
 			_r_tray_destroy (hwnd, &GUID_TrayIcon);
 
+			_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: before engine cleanup", 0, NULL);
 			hengine = _wfp_getenginehandle ();
 
 			_wfp_uninitialize (hengine, FALSE);
+			_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: after engine cleanup", 0, NULL);
 
 			_r_imagelist_destroy (config.himg_rules_small);
 			_r_imagelist_destroy (config.himg_rules_large);
@@ -2532,6 +2537,7 @@ INT_PTR CALLBACK DlgProc (
 			BufferedPaintUnInit ();
 
 			PostQuitMessage (0);
+			_r_log (LOG_LEVEL_ERROR, NULL, L"SWTRACE: quit message posted", 0, NULL);
 
 			break;
 		}

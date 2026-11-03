@@ -275,6 +275,10 @@ WF_State=false
             })
             Write-Host ("Synthetic automatic rules saved: {0}" -f $saved.Count)
         }
+        $debugLog = Join-Path $appDir 'simplewall_debug.log'
+        if (Test-Path -LiteralPath $debugLog -PathType Leaf) {
+            Get-Content -LiteralPath $debugLog -Encoding Unicode | Where-Object { $_ -match 'SWTRACE:' } | ForEach-Object { Write-Host $_ }
+        }
         throw 'Application did not exit cleanly.'
     }
     if ($proc.ExitCode -ne 0) { throw "Application exit code: $($proc.ExitCode)." }
