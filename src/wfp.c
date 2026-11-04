@@ -1376,6 +1376,7 @@ BOOLEAN _wfp_createrulefilter (
 	FWP_RANGE0 fwp_range1;
 	FWP_RANGE0 fwp_range2;
 	FWP_BYTE_BLOB *byte_blob = NULL;
+	PR_BYTE package_sid = NULL;
 	PITEM_APP ptr_app = NULL;
 	BOOLEAN is_remoteaddr_set = FALSE;
 	BOOLEAN is_remoteport_set = FALSE;
@@ -1436,12 +1437,17 @@ BOOLEAN _wfp_createrulefilter (
 		}
 		else if (ptr_app->type == DATA_APP_UWP) // uwp app (win8+)
 		{
-			if (ptr_app->bytes)
+			// Profile entries can outlive package registry discovery. Their saved
+			// SID still identifies the package, so construct the condition from it.
+			if (!_r_obj_isstringempty (ptr_app->original_path))
+				package_sid = _r_str_tosid (ptr_app->original_path);
+
+			if (package_sid)
 			{
 				fwfc[count].fieldKey = FWPM_CONDITION_ALE_PACKAGE_ID;
 				fwfc[count].matchType = FWP_MATCH_EQUAL;
 				fwfc[count].conditionValue.type = FWP_SID;
-				fwfc[count].conditionValue.sid = (PSID)ptr_app->bytes->buffer;
+				fwfc[count].conditionValue.sid = (PSID)package_sid->buffer;
 
 				count += 1;
 			}
@@ -1710,6 +1716,9 @@ BOOLEAN _wfp_createrulefilter (
 	}
 
 CleanupExit:
+
+	if (package_sid)
+		_r_obj_dereference (package_sid);
 
 	if (ptr_app)
 		_r_obj_dereference (ptr_app);

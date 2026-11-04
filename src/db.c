@@ -612,6 +612,63 @@ VOID _app_db_parse_ruleconfig (
 	_r_obj_dereference (rule_name);
 }
 
+// RtlDecompressBuffer can report success after filling a truncated buffer.
+static NTSTATUS _app_db_decompressbuffer (
+	_In_ USHORT format,
+	_In_ PR_BYTEREF buffer,
+	_Out_ PR_BYTE_PTR out_buffer
+)
+{
+	PR_BYTE bytes;
+	ULONG allocation_length;
+	ULONG limit_length = PR_SIZE_BUFFER_OVERFLOW;
+	ULONG return_length;
+	NTSTATUS status;
+
+	*out_buffer = NULL;
+
+	// The native API takes ULONG lengths; preserve the routine buffer limit
+	// and check before doubling or narrowing the compressed length.
+	if (!buffer->length || buffer->length > PR_SIZE_BUFFER_OVERFLOW / 2)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	allocation_length = (ULONG)buffer->length * 2;
+
+	// Each LZNT1 chunk expands to at most 4096 bytes and consumes input.
+	// Bound failed LZNT1 probes before trying the XPRESS format.
+	if (format == COMPRESSION_FORMAT_LZNT1 && buffer->length < PR_SIZE_BUFFER_OVERFLOW / 4096)
+		limit_length = (ULONG)buffer->length * 4096;
+
+	for (;;)
+	{
+		bytes = _r_obj_createbyte_ex (NULL, allocation_length);
+		return_length = 0;
+
+		status = RtlDecompressBuffer (format, (PUCHAR)bytes->buffer, allocation_length, (PUCHAR)buffer->buffer, (ULONG)buffer->length, &return_length);
+
+		if (NT_SUCCESS (status) && return_length < allocation_length)
+		{
+			_r_obj_setbytelength_ex (bytes, return_length, allocation_length);
+			*out_buffer = bytes;
+
+			return status;
+		}
+
+		_r_obj_dereference (bytes);
+
+		if (NT_SUCCESS (status) && return_length > allocation_length)
+			return STATUS_DATA_ERROR;
+
+		if (!NT_SUCCESS (status) && status != STATUS_BAD_COMPRESSION_BUFFER)
+			return status;
+
+		if (allocation_length == limit_length)
+			return STATUS_INSUFFICIENT_RESOURCES;
+
+		allocation_length = (allocation_length > limit_length / 2) ? limit_length : allocation_length * 2;
+	}
+}
+
 _Success_ (NT_SUCCESS (return))
 NTSTATUS _app_db_decodebody (
 	_Inout_ PDB_INFORMATION db_info
@@ -622,6 +679,9 @@ NTSTATUS _app_db_decodebody (
 	PR_BYTE new_bytes;
 	USHORT architecture;
 	BYTE profile_type;
+	BOOLEAN is_arm;
+	BOOLEAN is_hash_validated = FALSE;
+	NTSTATUS hash_status = STATUS_SUCCESS;
 	NTSTATUS status;
 
 	if (db_info->bytes->length < PROFILE2_HEADER_LENGTH)
@@ -641,6 +701,9 @@ NTSTATUS _app_db_decodebody (
 	// skip hash
 	_r_obj_skipbytelength (&db_info->bytes->sr, PROFILE2_SHA256_LENGTH);
 
+	status = _r_sys_getprocessorinformation (&architecture, NULL, NULL);
+	is_arm = NT_SUCCESS (status) && (architecture == PROCESSOR_ARCHITECTURE_ARM || architecture == PROCESSOR_ARCHITECTURE_ARM64);
+
 	switch (profile_type)
 	{
 		case PROFILE2_ID_COMPRESSED:
@@ -648,10 +711,30 @@ NTSTATUS _app_db_decodebody (
 			// decompress bytes
 			for (ULONG_PTR i = 0; i < RTL_NUMBER_OF (format); i++)
 			{
-				status = _r_sys_decompressbuffer (format[i], &db_info->bytes->sr, &new_bytes);
+				status = _app_db_decompressbuffer (format[i], &db_info->bytes->sr, &new_bytes);
 
 				if (NT_SUCCESS (status))
 				{
+					// XPRESS data can also be accepted as a short LZNT1 stream.
+					// Use the existing hash to distinguish candidates where supported.
+					if (i == 0 && !is_arm && db_info->hash &&
+						(new_bytes->length < sizeof (profile2_fourcc) || !RtlEqualMemory (new_bytes->buffer, profile2_fourcc, sizeof (profile2_fourcc))))
+					{
+						hash_status = _app_db_ishashvalid (&new_bytes->sr, &db_info->hash->sr);
+
+						if (!NT_SUCCESS (hash_status))
+						{
+							_r_obj_dereference (new_bytes);
+
+							if (hash_status == STATUS_INVALID_IMAGE_HASH)
+								continue;
+
+							return hash_status;
+						}
+
+						is_hash_validated = TRUE;
+					}
+
 					_r_obj_movereference (&db_info->bytes, new_bytes);
 
 					break;
@@ -681,20 +764,18 @@ NTSTATUS _app_db_decodebody (
 	}
 
 	if (!NT_SUCCESS (status))
-		return status;
+		return (hash_status == STATUS_INVALID_IMAGE_HASH) ? hash_status : status;
 
-	if (RtlEqualMemory (db_info->bytes->buffer, profile2_fourcc, sizeof (profile2_fourcc)))
+	if (db_info->bytes->length >= sizeof (profile2_fourcc) &&
+		RtlEqualMemory (db_info->bytes->buffer, profile2_fourcc, sizeof (profile2_fourcc)))
 		return STATUS_MORE_PROCESSING_REQUIRED;
 
 	// fix arm64 crash that was introduced by Micro$oft (issue #1228)
-	if (NT_SUCCESS (_r_sys_getprocessorinformation (&architecture, NULL, NULL)))
-	{
-		if (architecture == PROCESSOR_ARCHITECTURE_ARM || architecture == PROCESSOR_ARCHITECTURE_ARM64)
-			return STATUS_SUCCESS;
-	}
+	if (is_arm)
+		return STATUS_SUCCESS;
 
 	// validate hash
-	if (db_info->hash)
+	if (db_info->hash && !is_hash_validated)
 		status = _app_db_ishashvalid (&db_info->bytes->sr, &db_info->hash->sr);
 
 	return status;

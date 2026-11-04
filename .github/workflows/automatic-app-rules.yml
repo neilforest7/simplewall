@@ -89,6 +89,13 @@ jobs:
           if errorlevel 1 exit /b 1
           python tests\monitor_hash_lock_test.py
           if errorlevel 1 exit /b 1
+          python tests\internal_profile_decompression_test.py
+          if errorlevel 1 exit /b 1
+          where clang.exe >nul 2>nul
+          if errorlevel 1 exit /b 1
+          set "CC=clang"
+          python tests\uwp_profile_filter_test.py
+          if errorlevel 1 exit /b 1
       - name: Record the built executable hash
         id: built
         shell: pwsh
@@ -113,6 +120,16 @@ jobs:
           call "%VS_DIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           if errorlevel 1 exit /b 1
           pwsh -NoProfile -File tests\windows_integration\run.ps1 -SimplewallExe bin\64\simplewall.exe
+          if errorlevel 1 exit /b 1
+      - name: Verify first-block automatic discovery
+        if: ${{ !cancelled() && steps.built.outcome == 'success' }}
+        timeout-minutes: 6
+        shell: cmd
+        run: |
+          if not defined VS_DIR exit /b 1
+          call "%VS_DIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
+          if errorlevel 1 exit /b 1
+          pwsh -NoProfile -File tests\windows_firstconnect\run.ps1 -SimplewallExe bin\64\simplewall.exe
           if errorlevel 1 exit /b 1
       - name: Prepare the tested application
         shell: pwsh
