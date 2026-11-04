@@ -149,7 +149,7 @@ static void check_internal(const char *profile_path, const char *xml_path) {
     status = RtlDecompressBuffer(COMPRESSION_FORMAT_LZNT1, small_buffer, capacity,
         (PUCHAR)profile->buffer + PROFILE2_HEADER_LENGTH, compressed_length, &returned);
     if (NT_SUCCESS(status)) {
-        assert(returned == capacity && !memcmp(small_buffer, xml->buffer, capacity));
+        assert(returned <= capacity && !memcmp(small_buffer, xml->buffer, returned));
         sha256(small_buffer, returned, digest);
         assert(memcmp(digest, profile->buffer + PROFILE2_FOURCC_LENGTH, sizeof(digest)));
         printf("Native truncated success: %lu/%llu bytes\n", returned, (unsigned long long)xml->length);

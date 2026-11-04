@@ -6,3 +6,4 @@
 *.txt diff
 *.xml diff
 *.lng diff
+bin/profile_internal.xml text eol=lf
